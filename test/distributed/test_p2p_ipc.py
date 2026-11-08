@@ -14,7 +14,6 @@ from torch.testing._internal.common_utils import (
     HardwareClassification,
     requires_cuda_p2p_access,
     run_tests,
-    TEST_WITH_ROCM,
 )
 
 
@@ -153,9 +152,6 @@ class P2PIpcTest(MultiProcContinuousTest):
         "fabric handle IPC path only exercised on the fabric-capable h100-fabric CI config; "
         "unconditionally skipped elsewhere (deadlocks on B200, see "
         "https://github.com/pytorch/pytorch/issues/189879)",
-    )
-    @unittest.skipIf(
-        TEST_WITH_ROCM, "expandable_segments mode is not supported on ROCm"
     )
     def test_p2p_ipc_expandable_segments(self) -> None:
         """

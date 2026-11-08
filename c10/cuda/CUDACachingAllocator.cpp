@@ -320,15 +320,8 @@ struct SegmentRange {
   SegmentRange(void* p, size_t s) : ptr(static_cast<char*>(p)), size(s) {}
 };
 
-// Expandable segments have no ROCm fabric handle path, so ROCm keeps POSIX fds
-// even on devices where get_fabric_access() is true for symmetric memory.
 bool use_fabric_handles(c10::DeviceIndex device) {
-#ifdef USE_ROCM
-  (void)device;
-  return false;
-#else
   return cuda::get_fabric_access(device);
-#endif
 }
 
 #if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED) || \
@@ -603,7 +596,9 @@ struct ExpandableSegment {
       prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
       if (ipcEnabled()) {
         if (use_fabric_handles(device_)) {
-#ifndef USE_ROCM
+#ifdef USE_ROCM
+          prop.requestedHandleType = hipMemHandleTypeFabric;
+#else
           prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
 #endif
         } else {
@@ -734,21 +729,23 @@ struct ExpandableSegment {
         const int fd = std::get<int>(*handle.shareable_handle);
         buf.write(reinterpret_cast<const char*>(&fd), sizeof(fd));
       } else {
-#ifdef USE_ROCM
-        TORCH_INTERNAL_ASSERT(
-            false, "expandable segment with fabric handle not supported");
-#else
         if (!handle.shareable_handle) {
           CUmemFabricHandle fabric_handle;
+#ifdef USE_ROCM
+          static_assert(
+              sizeof(CUmemFabricHandle) == sizeof(hipMemFabricHandle_t));
+          C10_CUDA_CHECK(hipMemExportToShareableHandle(
+              &fabric_handle, handle.handle, hipMemHandleTypeFabric, 0));
+#else
           C10_CUDA_DRIVER_CHECK(DriverAPI::get()->cuMemExportToShareableHandle_(
               &fabric_handle, handle.handle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
+#endif
           handle.shareable_handle = fabric_handle;
           LOG(INFO) << "use fabric handle to share expandable segments.";
         }
         const auto& exported =
             std::get<CUmemFabricHandle>(*handle.shareable_handle);
         buf.write(reinterpret_cast<const char*>(&exported), sizeof(exported));
-#endif
       }
     }
     return rangeFromHandles(begin, end);
@@ -778,6 +775,10 @@ struct ExpandableSegment {
         header.segment_size,
         std::move(peers),
         header.num_handles);
+#ifdef USE_ROCM
+    segment->host_access_ =
+        header.handle_type != Expandable_Segments_Handle_Type::FABRIC_HANDLE;
+#endif
 // older build setups (e.g. multiwheels) do not have this syscall, added 2020
 // but the kernel on the system might still support it.
 #ifndef _WIN32
@@ -843,10 +844,7 @@ struct ExpandableSegment {
       }
 #endif // !_WIN32
     } else {
-#ifdef USE_ROCM
-      TORCH_INTERNAL_ASSERT(
-          false, "expandable segment with fabric handle not supported");
-#elif defined(_WIN32)
+#ifdef _WIN32
       TORCH_CHECK(
           false, "IPC expandable segments are not supported on Windows");
 #else
@@ -856,6 +854,10 @@ struct ExpandableSegment {
         buf.read(
             reinterpret_cast<char*>(&fabric_handle), sizeof(CUmemFabricHandle));
         CUmemGenericAllocationHandle handle = 0;
+#ifdef USE_ROCM
+        C10_CUDA_CHECK(hipMemImportFromShareableHandle(
+            &handle, &fabric_handle, hipMemHandleTypeFabric));
+#else
         C10_CUDA_DRIVER_CHECK_MSG(
             DriverAPI::get()->cuMemImportFromShareableHandle_(
                 &handle,
@@ -865,6 +867,7 @@ struct ExpandableSegment {
             " fabric_info: {",
             get_nvml_fabric_info(device),
             "}");
+#endif
         LOG(INFO) << "use fabric handle to import expandable segments.";
         segment->handles_.emplace_back(handle);
       }
@@ -953,8 +956,9 @@ struct ExpandableSegment {
  private:
   void setAccess(c10::DeviceIndex device, size_t begin, size_t end) {
 #if defined(USE_ROCM) && (ROCM_VERSION >= 70200)
-    constexpr int num_desc = 2;
-    std::array<CUmemAccessDesc, num_desc> desc{};
+    std::array<CUmemAccessDesc, 2> desc{};
+    // HIP rejects host access on memory imported from fabric handles.
+    const int num_desc = host_access_ ? 2 : 1;
     desc[1].location.type = CU_MEM_LOCATION_TYPE_HOST;
     desc[1].location.id = 0; // ignored
     desc[1].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
@@ -1091,6 +1095,9 @@ struct ExpandableSegment {
   size_t segment_size_;
   size_t mapped_size_;
   size_t max_handles_;
+#ifdef USE_ROCM
+  bool host_access_ = true;
+#endif
   struct Handle {
     CUmemGenericAllocationHandle handle;
     std::optional<std::variant<int, CUmemFabricHandle>> shareable_handle;
