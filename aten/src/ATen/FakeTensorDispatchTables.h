@@ -6,6 +6,10 @@
 
 #include <cstdint>
 
+namespace c10 {
+class OperatorHandle;
+} // namespace c10
+
 namespace at::impl {
 
 // C++-side copy of the Python decomp/meta/prims/op_impl registries, and of the
@@ -22,8 +26,8 @@ namespace at::impl {
 //               torch._subclasses.fake_impls.op_implementations_dict, via
 //               register_op_impl / _deregister_op_impl, minus ops whose C++
 //               meta kernel is used instead (see cpp_meta_supports_symint_ops).
-//               (Predicate-based op_impls are matched separately in
-//               fakeFallback and are not mirrored here.)
+//               (Predicate-based op_impls are not mirrored here;
+//               fakeHasPythonFakeImpl re-implements the predicates.)
 //   - PrimMeta: prims ops that define a prim_meta_impl, via torch._prims
 //   - PythonCIA: Python CompositeImplicitAutograd overrides, via
 //                OpOverload.py_impl
@@ -80,5 +84,16 @@ inline bool fakeDispatchCategoriesHave(
     FakeDispatchCategory category) {
   return categories & fakeDispatchCategoryBit(category);
 }
+
+// Whether Python's FakeTensorMode runs op through a Python implementation
+// rather than its Meta kernel, which the C++ fake fallback must reject: an op
+// in the OpImpl, CustomOpImpl, PrimMeta or PythonCIA table, or one an
+// op_implementations predicate selects (constructors, the dynamic_output_shape
+// and data_dependent_output tags, and _foreach_ ops with a Meta kernel), as
+// _dispatch_impl checks them. Decomp and StaticShapeDecomp ops are decomposed
+// only depending on the inputs, and Meta ops run their Meta kernel, so callers
+// check those. alias's op_impl, which only keeps the recorded dispatch keys, is
+// not registered in OpImpl, as the fallback keeps them itself.
+TORCH_API bool fakeHasPythonFakeImpl(const c10::OperatorHandle& op);
 
 } // namespace at::impl
