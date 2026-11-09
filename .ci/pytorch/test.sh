@@ -437,6 +437,20 @@ test_tsan() {
   assert_git_not_dirty
 }
 
+test_cuspy() {
+  # The Cuspy tests skip below CUDA 13.5 + libcupti 13.5 (the CUDA 13.5 image preinstalls
+  # libcupti 13.5); fail instead of passing vacuously.
+  (cd test && python -c "from torch.testing._internal.common_cuda import TEST_CUPTI_V13_5; assert TEST_CUPTI_V13_5, 'Cuspy tests need a CUDA >= 13.5 build and libcupti >= 13.5'")
+  time python test/run_test.py --include \
+    profiler/test_cuspy \
+    profiler/test_cuspy_decoder \
+    profiler/test_cuspy_node_timer \
+    profiler/test_cupti_python \
+    profiler/test_cupti_pm_sampling \
+    --verbose
+  assert_git_not_dirty
+}
+
 test_python_shard() {
   if [[ -z "$NUM_TEST_SHARDS" ]]; then
     echo "NUM_TEST_SHARDS must be defined to run a Python test shard"
@@ -2641,6 +2655,8 @@ elif [[ "$TEST_CONFIG" == *torchtitan* ]]; then
   test_torchtitan
 elif [[ "${TEST_CONFIG}" == *executorch* ]]; then
   test_executorch
+elif [[ "$TEST_CONFIG" == 'cuspy' ]]; then
+  test_cuspy
 elif [[ "$TEST_CONFIG" == 'quantization' ]]; then
   test_quantization
 elif [[ "${BUILD_ENVIRONMENT}" == *libtorch* ]]; then
