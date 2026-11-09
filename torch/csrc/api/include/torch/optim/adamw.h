@@ -22,6 +22,14 @@ struct TORCH_API AdamWOptions : public OptimizerCloneableOptions<AdamWOptions> {
   TORCH_ARG(double, eps) = 1e-8;
   TORCH_ARG(double, weight_decay) = 1e-2;
   TORCH_ARG(bool, amsgrad) = false;
+  // --- lbtorch extension (see PLAN.md row 9 / adamw-foreach-fused-capturable) ---
+  // Mirrors `torch/optim/adamw.py`'s `foreach`/`fused`/`capturable` kwargs.
+  // Unlike Python, these are plain bools here (no `None` "auto-select"
+  // tri-state) -- the C++ frontend favors explicit control over device-
+  // dependent heuristics. `foreach` and `fused` are mutually exclusive.
+  TORCH_ARG(bool, foreach) = false;
+  TORCH_ARG(bool, fused) = false;
+  TORCH_ARG(bool, capturable) = false;
 
  public:
   void serialize(torch::serialize::InputArchive& archive) override;
@@ -35,10 +43,22 @@ struct TORCH_API AdamWOptions : public OptimizerCloneableOptions<AdamWOptions> {
 
 struct TORCH_API AdamWParamState
     : public OptimizerCloneableParamState<AdamWParamState> {
+  // Host-resident step counter. This remains the source of truth for the
+  // original (non-foreach, non-capturable, non-fused) code path and is kept
+  // backwards compatible with every existing serialized archive / call site.
   TORCH_ARG(int64_t, step) = 0;
   TORCH_ARG(torch::Tensor, exp_avg);
   TORCH_ARG(torch::Tensor, exp_avg_sq);
   TORCH_ARG(torch::Tensor, max_exp_avg_sq);
+  // --- lbtorch extension ---
+  // Device-resident scalar step counter, used only when `capturable` and/or
+  // `fused` is enabled (mirrors Python's `state["step"]` always being a
+  // tensor; see `torch/optim/adam.py::_init_group`, "special device hosting
+  // for step"). Keeping it device-resident lets the increment and the bias-
+  // correction powers be expressed as ordinary tensor ops that can be
+  // captured into a CUDA graph -- no `.item()` host sync is on the hot path.
+  // Left undefined for the default (non-capturable, non-fused) path.
+  TORCH_ARG(torch::Tensor, step_tensor);
 
  public:
   void serialize(torch::serialize::InputArchive& archive) override;
@@ -69,6 +89,9 @@ class TORCH_API AdamW : public Optimizer {
         defaults.weight_decay() >= 0,
         "Invalid weight_decay value: ",
         defaults.weight_decay());
+    TORCH_CHECK(
+        !(defaults.foreach() && defaults.fused()),
+        "`fused` and `foreach` cannot both be true");
   }
   explicit AdamW(std::vector<Tensor> params, AdamWOptions defaults = {})
       : AdamW({OptimizerParamGroup(std::move(params))}, std::move(defaults)) {}
@@ -82,5 +105,18 @@ class TORCH_API AdamW : public Optimizer {
   static void serialize(Self& self, Archive& archive) {
     _TORCH_OPTIM_SERIALIZE_WITH_TEMPLATE_ARG(AdamW);
   }
+
+  // One AdamW::step() call dispatches a param group to exactly one of these,
+  // based on `options.foreach()` / `options.fused()`. Each mirrors the
+  // correspondingly named function in `torch/optim/adam.py` as closely as
+  // possible (bias-correction terms, epsilon placement, and weight-decay
+  // order are copied verbatim from the Python reference). `capturable` is
+  // NOT a fourth, separate path -- exactly as in Python, it's an orthogonal
+  // flag that `step_single_tensor` and `step_foreach` both branch on
+  // internally, trading a host-scalar bias-correction computation for an
+  // all-device-tensor one that never needs to read `step` back to the host.
+  void step_single_tensor(OptimizerParamGroup& group, AdamWOptions& options);
+  void step_foreach(OptimizerParamGroup& group, AdamWOptions& options);
+  void step_fused(OptimizerParamGroup& group, AdamWOptions& options);
 };
 } // namespace torch::optim

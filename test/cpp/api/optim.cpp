@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <c10/util/irange.h>
+#include <c10/util/tempfile.h>
+#include <torch/optim/adamw_checkpoint_bridge.h>
 #include <torch/torch.h>
 
 #include <test/cpp/api/optim_baseline.h>
@@ -326,6 +328,169 @@ TEST(OptimTest, ProducesPyTorchValues_AdamWWithAMSGrad) {
   check_exact_values<AdamW>(
       AdamWOptions(1.0).amsgrad(true),
       expected_parameters::AdamW_with_amsgrad());
+}
+
+// --- lbtorch extension: foreach / fused / capturable --------------------
+// These mirror the standalone-harness comparisons documented in
+// docs/adamw_checkpoint_interop.md (run there against Python's
+// torch.optim.AdamW on a pip wheel, since a full lbtorch source build
+// wasn't feasible in that validation environment). They're added here so
+// they run for real under lbtorch's own build/CI, against lbtorch's own
+// compiled AdamW -- that run is NOT something this change's author was able
+// to execute (no cmake/ninja + no time budget for an hours-long from-source
+// build in this environment); said explicitly rather than claimed as
+// verified.
+namespace {
+
+// Builds `n` fixed-shape float32 tensors with deterministic (not
+// RNG-sourced) values so this test's expectations don't depend on an RNG
+// engine matching anything -- same scheme as the standalone harness for
+// exactly the same reason, just inlined here instead of shared, to keep
+// this test self-contained.
+std::vector<torch::Tensor> adamw_ext_test_tensors(int64_t seed_offset) {
+  std::vector<std::vector<int64_t>> shapes = {{4, 4}, {8}, {16, 4}, {3, 5, 2}};
+  std::vector<torch::Tensor> out;
+  int64_t off = seed_offset;
+  for (auto& shape : shapes) {
+    int64_t numel = 1;
+    for (auto s : shape) numel *= s;
+    std::vector<float> data(numel);
+    for (int64_t i = 0; i < numel; ++i) {
+      double x = 0.1 * static_cast<double>(i) + static_cast<double>(off);
+      data[i] = static_cast<float>(0.05 * std::sin(x) + 0.001 * std::cos(3.0 * x));
+    }
+    out.push_back(torch::from_blob(data.data(), shape, torch::kFloat32).clone());
+    off += 1000;
+  }
+  return out;
+}
+
+// Runs `num_steps` AdamW steps under `options` starting from the same
+// deterministic params/grads every time, returning the final flattened
+// parameter values concatenated into one tensor for easy allclose().
+torch::Tensor run_adamw_ext(AdamWOptions options, int64_t num_steps) {
+  auto params = adamw_ext_test_tensors(/*seed_offset=*/0);
+  for (auto& p : params) p.set_requires_grad(true);
+  AdamW optimizer(params, options);
+  for (int64_t step = 0; step < num_steps; ++step) {
+    auto grads = adamw_ext_test_tensors(/*seed_offset=*/500 + step * 37);
+    optimizer.zero_grad();
+    for (const auto i : c10::irange(params.size())) {
+      params[i].mutable_grad() = grads[i];
+    }
+    optimizer.step();
+  }
+  std::vector<torch::Tensor> flat;
+  flat.reserve(params.size());
+  for (auto& p : params) {
+    flat.push_back(p.detach().reshape({-1}).to(torch::kFloat64));
+  }
+  return torch::cat(flat);
+}
+
+AdamWOptions adamw_ext_test_options() {
+  return AdamWOptions(0.05)
+      .betas(std::make_tuple(0.9, 0.999))
+      .eps(1e-8)
+      .weight_decay(0.01);
+}
+
+} // namespace
+
+TEST(OptimTest, AdamWForeachMatchesSingleTensor) {
+  auto single = run_adamw_ext(adamw_ext_test_options(), 20);
+  auto foreach = run_adamw_ext(adamw_ext_test_options().foreach(true), 20);
+  // Same registered _foreach_* ops Python's foreach=True path uses against
+  // the same inputs; expect this tight (see docs/adamw_checkpoint_interop.md,
+  // observed 0.0 max abs diff against Python in the standalone harness).
+  ASSERT_TRUE(torch::allclose(single, foreach, /*rtol=*/1e-6, /*atol=*/1e-6));
+}
+
+TEST(OptimTest, AdamWFusedMatchesSingleTensor) {
+  auto single = run_adamw_ext(adamw_ext_test_options(), 20);
+  auto fused = run_adamw_ext(adamw_ext_test_options().fused(true), 20);
+  // Calls at::_fused_adamw_ directly (the real registered fused op, same one
+  // Python's fused=True dispatches to) -- not a reimplementation.
+  ASSERT_TRUE(torch::allclose(single, fused, /*rtol=*/1e-6, /*atol=*/1e-6));
+}
+
+TEST(OptimTest, AdamWCapturableMatchesNonCapturable) {
+  // torch.optim.AdamW(capturable=True) raises on CPU tensors upstream, so
+  // there is no Python CPU ground truth to compare against here (or in the
+  // standalone harness -- see docs/adamw_checkpoint_interop.md). capturable
+  // is cross-checked against this same, already Python-validated,
+  // non-capturable path instead: it's the same math, computed via device
+  // tensor ops (float32) instead of host scalars (double), so a small
+  // float32-precision-level gap vs the host path is expected, not a bug.
+  auto single = run_adamw_ext(adamw_ext_test_options(), 20);
+  auto capturable = run_adamw_ext(adamw_ext_test_options().capturable(true), 20);
+  ASSERT_TRUE(torch::allclose(single, capturable, /*rtol=*/1e-5, /*atol=*/1e-5));
+
+  auto foreach = run_adamw_ext(adamw_ext_test_options().foreach(true), 20);
+  auto foreach_capturable = run_adamw_ext(
+      adamw_ext_test_options().foreach(true).capturable(true), 20);
+  ASSERT_TRUE(
+      torch::allclose(foreach, foreach_capturable, /*rtol=*/1e-5, /*atol=*/1e-5));
+}
+
+TEST(OptimTest, AdamWForeachFusedAreMutuallyExclusive) {
+  ASSERT_THROW(
+      AdamW(
+          {torch::zeros({2, 2}, torch::requires_grad())},
+          adamw_ext_test_options().foreach(true).fused(true)),
+      c10::Error);
+}
+
+TEST(OptimTest, AdamWCheckpointBridgeRoundTrip) {
+  // Export after K steps, import into a second optimizer over fresh
+  // same-shape params, run one more step on each, and confirm they match --
+  // i.e. "save, load, continue" produces the same result as "just keep
+  // training," which is the whole point of the checkpoint bridge (see
+  // docs/adamw_checkpoint_interop.md). This exercises the C++ <-> C++ round
+  // trip in-process; the cross-language (Python <-> C++) directions were
+  // validated via the standalone harness documented there, not executed as
+  // part of this GTest binary.
+  auto options = adamw_ext_test_options();
+  const int64_t kStepsBeforeCheckpoint = 10;
+
+  auto params_a = adamw_ext_test_tensors(/*seed_offset=*/0);
+  for (auto& p : params_a) p.set_requires_grad(true);
+  AdamW optimizer_a(params_a, options);
+  for (int64_t step = 0; step < kStepsBeforeCheckpoint; ++step) {
+    auto grads = adamw_ext_test_tensors(/*seed_offset=*/500 + step * 37);
+    optimizer_a.zero_grad();
+    for (const auto i : c10::irange(params_a.size())) {
+      params_a[i].mutable_grad() = grads[i];
+    }
+    optimizer_a.step();
+  }
+
+  auto tmpfile = c10::make_tempfile();
+  torch::optim::checkpoint_bridge::export_checkpoint(optimizer_a, tmpfile.name);
+
+  auto params_b = adamw_ext_test_tensors(/*seed_offset=*/0);
+  for (auto& p : params_b) p.set_requires_grad(true);
+  AdamW optimizer_b(params_b, options);
+  torch::optim::checkpoint_bridge::import_checkpoint(optimizer_b, tmpfile.name);
+
+  auto next_grads = adamw_ext_test_tensors(
+      /*seed_offset=*/500 + kStepsBeforeCheckpoint * 37);
+
+  optimizer_a.zero_grad();
+  for (const auto i : c10::irange(params_a.size())) {
+    params_a[i].mutable_grad() = next_grads[i];
+  }
+  optimizer_a.step();
+
+  optimizer_b.zero_grad();
+  for (const auto i : c10::irange(params_b.size())) {
+    params_b[i].mutable_grad() = next_grads[i];
+  }
+  optimizer_b.step();
+
+  for (const auto i : c10::irange(params_a.size())) {
+    ASSERT_TRUE(torch::allclose(params_a[i], params_b[i], 1e-6, 1e-6));
+  }
 }
 
 TEST(OptimTest, ProducesPyTorchValues_Adagrad) {
