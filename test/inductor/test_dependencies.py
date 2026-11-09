@@ -27,7 +27,7 @@ class TestDependencies(InductorTestCase):
     def _create_buffer(self, name, shape, dtype=torch.float32):
         return Buffer(
             name=name,
-            layout=FixedLayout(torch.device("meta"), dtype=dtype, size=shape),
+            layout=FixedLayout(torch.device("cpu"), dtype=dtype, size=shape),
         )
 
     def setUp(self):
@@ -66,7 +66,7 @@ class TestDependencies(InductorTestCase):
             )
 
         pointwise = Pointwise.create(
-            device=torch.device("meta"),
+            device=torch.device("cpu"),
             dtype=torch.int32,
             inner_fn=inner_fn,
             ranges=[1024 * 4],
@@ -99,7 +99,7 @@ class TestDependencies(InductorTestCase):
             )
 
         pointwise = Pointwise.create(
-            device=torch.device("meta"),
+            device=torch.device("cpu"),
             dtype=torch.int32,
             inner_fn=inner_fn,
             ranges=[1024 * 4],
