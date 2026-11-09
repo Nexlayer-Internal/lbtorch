@@ -68,6 +68,7 @@ from torch._inductor.utils import (
     add_scheduler_init_hook,
     run_and_get_code,
     run_and_get_cpp_code,
+    run_and_get_graph_lowering,
     run_and_get_kernels,
     run_and_get_triton_code,
     run_fw_bw_and_get_code,
@@ -17535,6 +17536,69 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             (torch.randn((2, 2), device=self.device),),
             check_lowp=False,
         )
+
+    @config.patch(implicit_fallbacks=True, force_disable_caches=True)
+    @parametrize("tag", ("needs_fixed_stride_order", "needs_exact_strides"))
+    @parametrize("view_first", (False, True))
+    def test_custom_op_layout_constraint_shares_input_with_transpose(
+        self, tag, view_first
+    ):
+        # See Note [Constrain shared storage inputs first]. needs_exact_strides is
+        # the default for untagged custom ops.
+        with torch.library._scoped_library("mylib", "FRAGMENT") as lib:
+            lib.define(
+                "add_t(Tensor a, Tensor b) -> Tensor", tags=(getattr(torch.Tag, tag),)
+            )
+            lib.impl("add_t", lambda a, b: a + b.T, "CompositeExplicitAutograd")
+
+            def fn(x):
+                z = (x * 2).relu()
+                a, b = (z.T, z) if view_first else (z, z.T)
+                return torch.ops.mylib.add_t(a, b)
+
+            x = torch.randn(7, 3, device=self.device).T
+            out, (graph,) = run_and_get_graph_lowering(
+                torch.compile(fn, fullgraph=True), x
+            )
+            self.assertEqual(out, fn(x))
+            (kernel,) = [
+                op
+                for op in graph.operations
+                if isinstance(op, torch._inductor.ir.FallbackKernel)
+            ]
+            self.assertEqual(len({inp.get_name() for inp in kernel.inputs}), 1)
+
+    @config.patch(implicit_fallbacks=True, force_disable_caches=True)
+    @parametrize("tag", ("needs_fixed_stride_order", "needs_exact_strides"))
+    @parametrize("realized", (False, True))
+    @parametrize("write", ("clone", "source"))
+    def test_custom_op_layout_constraint_keeps_a_written_input_apart(
+        self, tag, realized, write
+    ):
+        with torch.library._scoped_library("mylib", "FRAGMENT") as lib:
+            lib.define(
+                "zero_add_t_(Tensor(a!) x, Tensor y) -> ()",
+                tags=(getattr(torch.Tag, tag),),
+            )
+
+            def zero_add_t_(x, y):
+                x.zero_()
+                x.add_(y.T + 1)
+
+            lib.impl("zero_add_t_", zero_add_t_, "CompositeExplicitAutograd")
+
+            def fn(x, y):
+                # An extern kernel realizes z before the op.
+                z = torch.mm(x, y) if realized else (x * 2).relu()
+                # The op writes w and reads wt, which eager keeps apart, so the clone
+                # must stay.
+                w, wt = (z.clone(), z.T) if write == "clone" else (z, z.clone().T)
+                torch.ops.mylib.zero_add_t_(w, wt)
+                return w + 1
+
+            x = torch.randn(7, 3, device=self.device).T
+            y = torch.randn(7, 7, device=self.device)
+            self.assertEqual(torch.compile(fn, fullgraph=True)(x, y), fn(x, y))
 
     @requires_gpu()
     @config.patch(implicit_fallbacks=True)

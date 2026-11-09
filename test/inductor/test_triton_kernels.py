@@ -48,6 +48,8 @@ from torch._higher_order_ops.user_kernel_hop import (
 )
 from torch._higher_order_ops.utils import register_fake
 from torch._inductor import config as inductor_config, metrics
+from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import UserDefinedTritonKernel
 from torch._inductor.pattern_matcher import (
     CallFunctionVarArgs,
     PatternMatcherPass,
@@ -56,6 +58,7 @@ from torch._inductor.pattern_matcher import (
 from torch._inductor.utils import (
     fresh_cache,
     run_and_get_code,
+    run_and_get_graph_lowering,
     run_and_get_kernels,
     triton_version_uses_attrs_dict,
 )
@@ -3225,6 +3228,202 @@ def forward(self, x_1, output_1):
         compiled_inductor_f = torch.compile(f, backend="inductor", fullgraph=True)
         compiled_inductor_out = compiled_inductor_f(x)
         self.assertEqual(compiled_inductor_out, eager_out)
+
+    @inductor_config.patch(
+        triton_kernel_default_layout_constraint="needs_fixed_stride_order",
+        force_disable_caches=True,
+    )
+    @requires_gpu
+    @parametrize("dynamic", [False, True])
+    def test_layout_constraint_materializes_a_shared_input_once(self, dynamic):
+        def f(x, y):
+            z = (x * 2).relu()
+            a = torch.empty_like(x)
+            b = torch.empty_like(x)
+            n_elements = x.numel()
+            add_kernel[(n_elements // 16,)](z, z, a, n_elements, BLOCK_SIZE=16)
+            add_kernel[(n_elements // 16,)](z, y, b, n_elements, BLOCK_SIZE=16)
+            return a + b
+
+        # 2D, so that dynamic shapes give symbolic strides.
+        x = torch.randn(8, 8, device=GPU_TYPE)
+        y = torch.randn(8, 8, device=GPU_TYPE)
+        compiled_out, (graph,) = run_and_get_graph_lowering(
+            torch.compile(f, fullgraph=True, dynamic=dynamic), x, y
+        )
+        self.assertEqual(compiled_out, f(x, y))
+        kernels = [
+            op for op in graph.operations if isinstance(op, UserDefinedTritonKernel)
+        ]
+        self.assertEqual(len(kernels), 2)
+        shared_inputs = (
+            kernels[0].kwargs["in_ptr0"],
+            kernels[0].kwargs["in_ptr1"],
+            kernels[1].kwargs["in_ptr0"],
+        )
+        self.assertEqual(len({arg.get_name() for arg in shared_inputs}), 1)
+
+    def _check_written_input_apart(self, source, write):
+        # One program, so its loads after the barrier see its stores.
+        @triton.jit
+        def store_then_load_transpose_kernel(
+            x_ptr,
+            xt_ptr,
+            n_elements,
+            ROWS: tl.constexpr,
+            COLS: tl.constexpr,
+            X_STRIDES: tl.constexpr,
+            XT_STRIDES: tl.constexpr,
+            BLOCK_SIZE: tl.constexpr,
+        ):
+            offsets = tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+            x_offsets = offsets // COLS * X_STRIDES[0] + offsets % COLS * X_STRIDES[1]
+            xt_rows = offsets // ROWS
+            xt_offsets = xt_rows * XT_STRIDES[0] + offsets % ROWS * XT_STRIDES[1]
+            tl.store(x_ptr + x_offsets, tl.zeros([BLOCK_SIZE], tl.float32), mask=mask)
+            tl.debug_barrier()
+            xt = tl.load(xt_ptr + xt_offsets, mask=mask)
+            tl.store(x_ptr + x_offsets, xt + 1, mask=mask)
+
+        def f(x, y):
+            # z is realized before the second kernel unless it is pointwise.
+            z = torch.mm(x, y) if source == "mm" else (x * 2).relu()
+            a = torch.zeros_like(z)
+            if source == "shared":
+                add_kernel[(1,)](z, z, a, z.numel(), BLOCK_SIZE=32)
+            # The kernel writes w and reads wt, which eager keeps apart, so the
+            # clones must stay.
+            w = z.clone() if write in ("clone", "both") else z
+            wt = z.clone().T if write in ("source", "both") else z.T
+            store_then_load_transpose_kernel[(1,)](
+                w,
+                wt,
+                w.numel(),
+                ROWS=w.shape[0],
+                COLS=w.shape[1],
+                X_STRIDES=w.stride(),
+                XT_STRIDES=wt.stride(),
+                BLOCK_SIZE=32,
+            )
+            # Returning w itself would realize z before the kernel is lowered.
+            return a, w + 1
+
+        x = torch.randn(7, 3, device=GPU_TYPE).T
+        y = torch.randn(7, 7, device=GPU_TYPE)
+        compiled_out, (graph,) = run_and_get_graph_lowering(
+            torch.compile(f, fullgraph=True), x, y
+        )
+        self.assertEqual(compiled_out, f(x, y))
+        (kernel,) = [
+            op
+            for op in graph.operations
+            if isinstance(op, UserDefinedTritonKernel) and "x_ptr" in op.kwargs
+        ]
+        self.assertNotEqual(
+            kernel.kwargs["x_ptr"].get_name(), kernel.kwargs["xt_ptr"].get_name()
+        )
+
+    @inductor_config.patch(
+        triton_kernel_default_layout_constraint="needs_fixed_stride_order",
+        force_disable_caches=True,
+    )
+    @requires_gpu
+    @parametrize("source", ["pointwise", "shared", "mm"])
+    @parametrize("write", ["clone", "source", "both"])
+    def test_layout_constraint_keeps_a_written_input_apart(self, source, write):
+        self._check_written_input_apart(source, write)
+
+    @inductor_config.patch(
+        triton_kernel_default_layout_constraint="needs_fixed_stride_order",
+        force_disable_caches=True,
+    )
+    @requires_gpu
+    @parametrize("write", ["clone", "source", "both"])
+    def test_layout_constraint_never_shares_a_written_input(self, write):
+        # With the clones dropped, the kernel writes the pointwise z and reads z.T,
+        # and the shared-storage pass must still leave them a copy each.
+        with mock.patch(
+            "torch._inductor.fx_passes.post_grad._aliased_by_writing_op",
+            return_value=False,
+        ):
+            self._check_written_input_apart("pointwise", write)
+
+    @inductor_config.patch(
+        triton_kernel_default_layout_constraint="needs_fixed_stride_order",
+        force_disable_caches=True,
+    )
+    @requires_gpu
+    @parametrize("view_first", [False, True])
+    @parametrize("use_eager_input_vals", [False, True])
+    def test_layout_constraint_shares_input_with_transpose(
+        self, view_first, use_eager_input_vals
+    ):
+        @triton.jit
+        def add_strided_kernel(
+            in_ptr0,
+            in_ptr1,
+            out_ptr,
+            n_elements,
+            COLS0: tl.constexpr,
+            COLS1: tl.constexpr,
+            STRIDES0: tl.constexpr,
+            STRIDES1: tl.constexpr,
+            BLOCK_SIZE: tl.constexpr,
+        ):
+            offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            offsets0 = offsets // COLS0 * STRIDES0[0] + offsets % COLS0 * STRIDES0[1]
+            offsets1 = offsets // COLS1 * STRIDES1[0] + offsets % COLS1 * STRIDES1[1]
+            mask = offsets < n_elements
+            a = tl.load(in_ptr0 + offsets0, mask=mask)
+            b = tl.load(in_ptr1 + offsets1, mask=mask)
+            tl.store(out_ptr + offsets, a + b, mask=mask)
+
+        def f(x):
+            z = (x * 2).relu()
+            a, b = (z.T, z) if view_first else (z, z.T)
+            out = torch.empty(x.numel(), dtype=x.dtype, device=x.device)
+            add_strided_kernel[(triton.cdiv(x.numel(), 32),)](
+                a,
+                b,
+                out,
+                x.numel(),
+                COLS0=a.shape[1],
+                COLS1=b.shape[1],
+                STRIDES0=a.stride(),
+                STRIDES1=b.stride(),
+                BLOCK_SIZE=32,
+            )
+            return out
+
+        run_node = GraphLowering.run_node
+        lowered = []
+
+        # The decomposition of the functional HOP copies eager_input_vals to the
+        # mutation node (_propagate_user_kernel_eager_input_vals), so drop them
+        # at lowering to take the constrain_to_fx_strides path.
+        def lower_node(graph, n):
+            if n.target is torch.ops.higher_order.triton_kernel_wrapper_mutation:
+                lowered.append("eager_input_vals" in n.meta)
+                if not use_eager_input_vals:
+                    n.meta.pop("eager_input_vals", None)
+            return run_node(graph, n)
+
+        x = torch.randn(7, 3, device=GPU_TYPE).T
+        with mock.patch.object(GraphLowering, "run_node", lower_node):
+            compiled_out, (graph,) = run_and_get_graph_lowering(
+                torch.compile(f, fullgraph=True), x
+            )
+        self.assertEqual(lowered, [True])
+        self.assertEqual(compiled_out, f(x))
+        kernels = [
+            op for op in graph.operations if isinstance(op, UserDefinedTritonKernel)
+        ]
+        self.assertEqual(len(kernels), 1)
+        self.assertEqual(
+            kernels[0].kwargs["in_ptr0"].get_name(),
+            kernels[0].kwargs["in_ptr1"].get_name(),
+        )
 
     @requires_gpu
     def test_triton_kernel_strided_input_nonzero_offset(self):

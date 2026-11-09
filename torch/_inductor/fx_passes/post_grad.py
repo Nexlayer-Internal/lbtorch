@@ -5,7 +5,7 @@ import itertools
 import logging
 import operator
 from collections import Counter, defaultdict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any, cast, TypeVar
 from typing_extensions import ParamSpec
 
@@ -17,6 +17,7 @@ from torch._decomp import register_decomposition
 from torch._dynamo.utils import counters, detect_fake_mode
 from torch._higher_order_ops.flex_gemm import _PRESERVE_FLEX_GEMM_GEMM_OP
 from torch._higher_order_ops.user_kernel_hop import (
+    get_user_kernel_hop_info,
     is_user_kernel_functional_hop,
     user_kernel_hop_infos,
     UserKernelHOPInfo,
@@ -1535,28 +1536,18 @@ def _collect_output_storage(
     )
 
 
-def _depends_on_storage_offset(node: torch.fx.Node) -> bool:
-    """Whether a user of ``node``, or of a view of it, depends on where it sits in its storage.
-
-    This is a denylist of consumers known to observe placement: ``as_strided``, whose
-    storage offset is relative to the storage, and user-defined kernels of any DSL,
-    which are opaque and may need an aligned base, for example to build a TMA
-    descriptor on the host or on the device. Other opaque consumers, such as custom
-    ops and extern fallback kernels, are intentionally not included. Views are
-    followed through single- and multi-output view ops.
-    """
+def _storage_users(node: torch.fx.Node) -> Iterator[torch.fx.Node]:
+    """The users of ``node`` and of its views, followed through single- and
+    multi-output view ops."""
     storage = get_node_storage(node)
     if storage is None:
-        return False
+        return
     pending = [node]
     seen = OrderedSet([node])
     while pending:
         current = pending.pop()
         for user in current.users:
-            if user.target is aten.as_strided.default:
-                return True
-            if is_user_kernel_functional_hop(user.target):
-                return True
+            yield user
             if user.op != "call_function" or user in seen:
                 continue
             val = user.meta.get("val")
@@ -1569,6 +1560,66 @@ def _depends_on_storage_offset(node: torch.fx.Node) -> bool:
             ):
                 seen.add(user)
                 pending.append(user)
+
+
+def _depends_on_storage_offset(node: torch.fx.Node) -> bool:
+    """Whether a user of ``node``, or of a view of it, depends on where it sits in its storage.
+
+    This is a denylist of consumers known to observe placement: ``as_strided``, whose
+    storage offset is relative to the storage, and user-defined kernels of any DSL,
+    which are opaque and may need an aligned base, for example to build a TMA
+    descriptor on the host or on the device. Other opaque consumers, such as custom
+    ops and extern fallback kernels, are intentionally not included.
+    """
+    return any(
+        user.target is aten.as_strided.default
+        or is_user_kernel_functional_hop(user.target)
+        for user in _storage_users(node)
+    )
+
+
+def _aliased_by_writing_op(node: torch.fx.Node, src_storage: int | None) -> bool:
+    """Whether a user-kernel functional HOP, ``auto_functionalized`` or
+    ``auto_functionalized_v2`` takes both ``node`` (or a view of it) and
+    ``src_storage`` as arguments and, once reinplaced, writes either of them.
+
+    Replacing such a ``node`` with its source would make the op write a storage that
+    it also reads through another argument: ``w = z.clone(); kernel(w, z.T)`` and
+    ``zt = z.clone(); kernel(z, zt.T)`` would both become ``kernel(z, z.T)``, which
+    reads its own writes.
+    """
+
+    def written_and_used(op: torch.fx.Node) -> tuple[list[Any], list[Any]] | None:
+        kwargs = cast(dict[str, Any], op.kwargs)
+        if get_user_kernel_hop_info(op.target, "functional") is not None:
+            kernel_args = kwargs["kwargs"]
+            names = kwargs["tensors_to_clone"]
+            return [kernel_args[name] for name in names], list(kernel_args.values())
+        if op.target is torch.ops.higher_order.auto_functionalized:
+            from torch._higher_order_ops.auto_functionalize import get_mutable_args
+
+            names, _ = get_mutable_args(cast(torch._ops.OpOverload, op.args[0]))
+            return [kwargs[name] for name in names], list(kwargs.values())
+        if op.target is torch.ops.higher_order.auto_functionalized_v2:
+            return kwargs["_all_bases"], list(kwargs.values())
+        return None
+
+    def storages(args: list[Any]) -> OrderedSet[int | None]:
+        leaves = pytree.tree_leaves(args)
+        return OrderedSet(get_node_storage(a) for a in leaves if isinstance(a, fx.Node))
+
+    storage = get_node_storage(node)
+    if storage is None or src_storage is None:
+        return False
+    for user in _storage_users(node):
+        if (accesses := written_and_used(user)) is not None:
+            written, used = map(storages, accesses)
+            if (
+                storage in used
+                and src_storage in used
+                and (storage in written or src_storage in written)
+            ):
+                return True
     return False
 
 
@@ -1670,12 +1721,17 @@ def remove_noop_ops(graph: torch.fx.Graph):
             # A non-view noop such as clone has fresh storage at offset 0. Replacing it
             # with a source at another offset changes what storage-relative users read,
             # so compare offsets only when such a user exists.
-            if same_tensor_meta(
-                node,
-                src,
-                skip_storage_offset=node_is_view
-                or not _depends_on_storage_offset(node),
-            ) and cond(*args, **kwargs):
+            if (
+                same_tensor_meta(
+                    node,
+                    src,
+                    skip_storage_offset=node_is_view
+                    or not _depends_on_storage_offset(node),
+                )
+                and cond(*args, **kwargs)
+                # Keep a real copy when an op writes it or its source and uses both.
+                and (node_is_view or not _aliased_by_writing_op(node, src_storage))
+            ):
                 node.replace_all_uses_with(src)
                 graph.erase_node(node)
 
