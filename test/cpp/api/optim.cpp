@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <c10/util/irange.h>
+#include <c10/util/tempfile.h>
 #include <torch/optim/adamw_checkpoint_bridge.h>
 #include <torch/torch.h>
 
