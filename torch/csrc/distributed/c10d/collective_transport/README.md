@@ -92,6 +92,27 @@ This is the same hazard family as `FSDP-DESIGN.md`'s incident #2
 crash instead of a hang. Fixed with a true heap leak (`new`'d, never
 deleted) so the destructor genuinely never runs, not even at exit.
 
+(One detail worth not being alarmed by when reading the raw logs: the
+watchdog's `"To avoid data inconsistency, we are taking the entire process
+down"` line, read in `ProcessGroupNCCL.cpp`'s `handleException()`, is
+followed by `std::rethrow_exception`, called from `Work::wait()` itself on
+the *calling* thread, synchronously, as part of `wait()`'s own return path
+-- not an independent, uncatchable abort from a background thread. That is
+exactly why `verify_live_nccl_collective()`'s own `try`/`catch` around
+`work->wait(timeout)` reliably catches it. `wait()` does, however, also
+synchronously call `abort()`/`abortComms()` on the wedged communicator
+*before* throwing -- a documented, deliberate PyTorch behavior (its own
+comment: "If throwing timed out exception without aborting nccl
+communicators here, it was observed that CUDA GPU will have 100%
+utilization and can not run new events successfully"). That first abort
+call is what actually matters here, and it completed without incident in
+every run. The crash this project hit and fixed (see above) came from a
+*second* teardown attempt on the same already-aborted communicator, later,
+via `~ProcessGroupNCCL()` during normal static destruction at process
+exit -- which is also why a true heap leak, not just avoiding an explicit
+`abort()` call, was the fix: it ensures that second attempt never happens
+at all.)
+
 With both fixes, `test_collective_correctness` and `repro_transport_no_hang`
 run repeatedly and cleanly in real (non-forced) auto-probe mode: the group
 consistently selects `host_staged_fallback` on IP66, with no hang and no
