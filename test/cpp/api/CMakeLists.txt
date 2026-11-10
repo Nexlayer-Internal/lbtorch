@@ -27,6 +27,7 @@ set(TORCH_API_TEST_SOURCES
   ${TORCH_API_TEST_DIR}/nn_utils.cpp
   ${TORCH_API_TEST_DIR}/optim.cpp
   ${TORCH_API_TEST_DIR}/ordered_dict.cpp
+  ${TORCH_API_TEST_DIR}/qwen3.cpp
   ${TORCH_API_TEST_DIR}/rnn.cpp
   ${TORCH_API_TEST_DIR}/sequential.cpp
   ${TORCH_API_TEST_DIR}/transformer.cpp

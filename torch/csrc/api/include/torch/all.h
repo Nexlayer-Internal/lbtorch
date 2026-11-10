@@ -14,6 +14,7 @@
 #include <torch/enum.h>
 #include <torch/fft.h>
 #include <torch/jit.h>
+#include <torch/models/qwen3.h>
 #include <torch/mps.h>
 #include <torch/nested.h>
 #include <torch/nn.h>
@@ -25,5 +26,6 @@
 #include <torch/types.h>
 #include <torch/utils.h>
 #include <torch/utils/checkpoint.h>
+#include <torch/utils/safetensors.h>
 #include <torch/version.h>
 #include <torch/xpu.h>
