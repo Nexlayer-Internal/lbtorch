@@ -3,6 +3,7 @@ set(TORCH_API_TEST_SOURCES
   ${TORCH_ROOT}/test/cpp/common/main.cpp
   ${TORCH_API_TEST_DIR}/autograd.cpp
   ${TORCH_API_TEST_DIR}/any.cpp
+  ${TORCH_API_TEST_DIR}/checkpoint.cpp
   ${TORCH_API_TEST_DIR}/dataloader.cpp
   ${TORCH_API_TEST_DIR}/enum.cpp
   ${TORCH_API_TEST_DIR}/expanding-array.cpp

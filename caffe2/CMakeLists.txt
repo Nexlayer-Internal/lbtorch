@@ -795,6 +795,7 @@ if(NOT NO_API AND NOT BUILD_LITE_INTERPRETER)
     ${TORCH_SRC_DIR}/csrc/api/src/serialize/input-archive.cpp
     ${TORCH_SRC_DIR}/csrc/api/src/serialize/output-archive.cpp
     ${TORCH_SRC_DIR}/csrc/api/src/print.cpp
+    ${TORCH_SRC_DIR}/csrc/api/src/utils/checkpoint.cpp
     ${TORCH_SRC_DIR}/csrc/api/src/xpu.cpp
   )
 endif()
