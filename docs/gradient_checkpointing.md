@@ -177,8 +177,56 @@ doesn't go stale if the build is re-run later with different results.
   forward+backward through a dropout layer must produce exactly the same
   input/weight gradients as the same network run with no checkpointing.
 - `ReducesPeakMemoryOnCuda` (guarded by `#ifdef USE_CUDA`, skips at runtime if
-  no CUDA device is present) -- a 64-layer, dim-2048 stack checkpointed as one
-  segment must show a lower `c10::cuda::CUDACachingAllocator` peak
-  `allocated_bytes` than the same stack run without checkpointing. Unexecuted
-  in this environment (no GPU); the allocator API calls were checked against
-  `c10/cuda/CUDACachingAllocator.h` and `c10/core/Allocator.h`, not guessed.
+  no CUDA device is present) -- a 64-layer stack, split into 8 checkpointed
+  segments of 8 layers each, must show a lower `c10::cuda::CUDACachingAllocator`
+  peak `allocated_bytes` than the same stack run without checkpointing.
+
+  **This test went through a real round of GPU-validated iteration.** The
+  first version (dim=2048, batch=256, the *entire* stack as a single
+  `checkpoint()` call) was built and run on real GPU hardware (RTX PRO 6000
+  Blackwell) by the project maintainer -- and failed: checkpointed peak came
+  out a hair *higher* than the non-checkpointed baseline (2196.76 MB vs
+  2192.57 MB), both sitting almost exactly on the stack's fixed
+  weight+gradient floor (64 * (16 MB weight + 16 MB gradient) ~= 2.1 GB). The
+  other 6 `CheckpointTest` cases (including both dropout/RNG tests) passed on
+  that same run, so this was isolated to the memory test specifically, not a
+  correctness regression in `checkpoint()` itself.
+
+  Root-caused (by reasoning through the memory trajectory, without GPU access
+  to reproduce it directly -- see the long comment directly above
+  `ReducesPeakMemoryOnCuda` in `test/cpp/api/checkpoint.cpp` for the full
+  derivation) to two compounding problems with that version of the test, not
+  with the implementation:
+  1. At dim=2048, each layer's weight+gradient (32 MB) outweighed its
+     activation (~2 MB) 16x, and because ordinary (non-checkpointed) backward
+     already frees each layer's activation as it finishes that layer, the
+     baseline's peak already landed on the weight+gradient floor with no
+     "everything held at once" spike for checkpointing to avoid in the first
+     place. Fixed by swapping to a small `dim` / large `batch` configuration,
+     so activation memory (`batch * dim`) dominates weight/gradient memory
+     (`dim * dim`, batch-independent) instead.
+  2. Independent of (1): checkpointing the *entire* stack as one segment is
+     provably a no-op, memory-wise -- backward still has to recompute and
+     hold every layer's activation simultaneously for that one segment,
+     identical to the non-checkpointed case. The benefit only appears once
+     the stack is split into multiple segments. Fixed by checkpointing in
+     groups of 8 layers instead of one block of 64; the one-giant-segment
+     measurement is kept in the rewritten test as a logged (not asserted)
+     comparison point, to confirm this diagnosis empirically rather than by
+     reasoning alone the next time this runs on real hardware.
+
+  The rewritten test also prints the allocator stats trajectory (right after
+  reset, after forward, after backward, for all three variants: baseline,
+  one-giant-segment, grouped) specifically so a real GPU run's actual memory
+  trajectory is visible, not just the final peak numbers.
+
+  **As of this revision, the rewritten test has not itself been executed on
+  real GPU hardware** -- it is this port's best analysis of the prior failing
+  run, not a confirmed fix. The allocator API calls (`emptyCache`,
+  `resetPeakStats`, `getDeviceStats`, `StatType::AGGREGATE`) are unchanged
+  from the version that already built and ran cleanly on the GPU hardware
+  above; the new additions (the three-way `Granularity` switch, the grouped
+  checkpointing loop, the `print_stats` helper) are ordinary C++ with no
+  CUDA-specific surface, checked by manual review (no CUDA toolkit exists for
+  macOS, so this could not be compiled in this environment at all, not even
+  to the extent `#ifdef USE_CUDA` code normally could be on a CUDA Linux box).
