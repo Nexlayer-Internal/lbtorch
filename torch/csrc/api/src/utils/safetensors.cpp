@@ -163,6 +163,12 @@ SafetensorsCollection SafetensorsCollection::FromDirectory(const std::string& di
   return coll;
 }
 
+SafetensorsCollection SafetensorsCollection::FromFile(const std::string& path) {
+  SafetensorsCollection coll;
+  coll.AddShard(path, nullptr);
+  return coll;
+}
+
 std::vector<std::string> SafetensorsCollection::names() const {
   std::vector<std::string> out;
   out.reserve(tensors_.size());

@@ -83,6 +83,9 @@ class TORCH_API SafetensorsCollection {
   //   - a single `model.safetensors` file.
   static SafetensorsCollection FromDirectory(const std::string& dir);
 
+  // A single arbitrary .safetensors file (e.g. a test fixture).
+  static SafetensorsCollection FromFile(const std::string& path);
+
   bool has(const std::string& name) const {
     return tensors_.find(name) != tensors_.end();
   }
