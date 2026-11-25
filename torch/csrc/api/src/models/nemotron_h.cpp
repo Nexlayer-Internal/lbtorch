@@ -484,6 +484,12 @@ Tensor mixer_packed(const Layer& L, const Tensor& h2, const SeqLayout& lay, cons
   if (L.type == BlockType::MLP) return mlp_fwd(h2, L, c);
   const int64_t T = h2.size(0);
   TORCH_CHECK(lay.tokens() == T, "nemotron_h: SeqLayout covers ", lay.tokens(), " tokens, activations have ", T);
+  if (L.type == BlockType::Attention && c.o->attn) {   // varlen flash path: one call over the whole packed batch
+    const int64_t nH = c.cfg->num_attention_heads, nKV = c.cfg->num_key_value_heads, hd = c.cfg->head_dim;
+    Tensor q = lin(h2, L.q_proj, c).view({T, nH, hd}), k = lin(h2, L.k_proj, c).view({T, nKV, hd}), v = lin(h2, L.v_proj, c).view({T, nKV, hd});
+    Tensor o = c.o->attn(q, k, v);
+    return lin(o.reshape({T, nH * hd}), L.o_proj, c);
+  }
   Tensor h = h2.unsqueeze(0);
   if (!lay.grouped) {
     if (L.type == BlockType::Mamba) return mamba_packed_seg(h, L, c, lay.lens, Tensor(), Tensor(), nullptr, nullptr).squeeze(0);

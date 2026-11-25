@@ -120,6 +120,10 @@ struct Probe {
 /// the AOT Triton autograd::Function plugs in here.
 using SsdFn = std::function<std::pair<Tensor, Tensor>(const Tensor& x, const Tensor& dt, const Tensor& A, const Tensor& Bh, const Tensor& Ch, const Tensor& D,
                                                       const Tensor& h0, int64_t chunk, const Tensor& cu_seqlens)>;
+/// Packed-attention hook (varlen flash attention supplied by the trainer): q [T,nH,hd], k, v [T,nKV,hd] in the activation dtype, rows = the whole packed micro-batch in SeqLayout order
+/// -> o [T,nH,hd]. Causality, sequence boundaries and prefix K/V sharing (grouped layouts) are the hook's business: it is built per batch from the SeqLayout. Unset: per-sequence SDPA
+/// (the CPU path and the parity reference). No rope, no q/k norm, no gate in this model, so the hook sees exactly the projections.
+using AttnFn = std::function<Tensor(const Tensor& q, const Tensor& k, const Tensor& v)>;
 TORCH_API std::pair<Tensor, Tensor> ssd_aten(const Tensor& x, const Tensor& dt, const Tensor& A, const Tensor& Bh, const Tensor& Ch, const Tensor& D, const Tensor& h0,
                                              int64_t chunk, const Tensor& cu_seqlens = Tensor());
 /// Token-by-token recurrence (the definition of the SSD; autograd = BPTT). Test oracle.
@@ -138,6 +142,7 @@ struct TORCH_API ForwardOptions {
   bool act_quant = false;   // quantise activations before quantised linears (W4A4 / W8A8) with the straight-through estimator
   MoeImpl moe = MoeImpl::Loop;
   SsdFn ssd;                // default ssd_aten
+  AttnFn attn;              // packed layout only (block_fwd / mixer_fwd); default per-sequence SDPA
   Probe* probe = nullptr;
   const std::vector<LayerState>* state_in = nullptr;  // per layer; undefined tensors = no prefix
   std::vector<LayerState>* state_out = nullptr;       // filled (graph-connected) when non-null
