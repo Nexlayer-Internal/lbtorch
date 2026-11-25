@@ -17,7 +17,7 @@
 //     trained on top of its prompt without recomputation and gradients flow back into the prompt.
 //  3. In BF16 mode dt / A / the SSD run in fp32 (HF computes softplus(dt + dt_bias) in the activation dtype); FP32 / FP64 modes are identical in structure.
 //  4. dt clamp bounds come from the config (dt_clamp_min / dt_clamp_max): HF's fallback clamps at time_step_min only, the CUDA kernel path at time_step_limit.
-//  5. MoE: the expert loop is expressed as sort-by-expert + per-expert linear + one index_add (same arithmetic as HF's per-expert loop); a grouped-GEMM
+//  5. MoE: the expert loop is expressed as (stable) sort-by-expert + per-expert linear + a fixed-order sum over the k slots of a token (HF's per-expert loop up to summation order); a grouped-GEMM
 //     variant (MoeImpl::GroupedMM) uses at::_grouped_mm.
 //  6. Frozen quantised linears: dequantised to the compute dtype per use; no custom transposed-product kernel (v1).
 
@@ -407,6 +407,7 @@ Tensor moe_fwd(const Tensor& x, const Layer& L, const Ctx& c) {
     Tensor smask = gmask.unsqueeze(-1).expand({-1, cf.n_group, E / cf.n_group}).reshape({-1, E});
     sfc = sfc.masked_fill(~smask.to(torch::kBool), -std::numeric_limits<double>::infinity());
     idx = std::get<1>(at::topk(sfc, k, -1, true, false));
+    idx = std::get<0>(idx.sort(-1));   // canonical slot order (ascending expert id): the order topk(sorted = false) returns the selected experts in is not specified, and the combine below sums in slot order
   }
   Tensor w = scores.gather(1, idx);
   if (cf.norm_topk_prob) w = w / (w.sum(-1, true) + 1e-20);
@@ -418,7 +419,9 @@ Tensor moe_fwd(const Tensor& x, const Layer& L, const Ctx& c) {
   NVPUSH("moe sort");
   const int64_t Lw = zl.size(-1);
   Tensor flat_e = idx.reshape({-1});
-  Tensor order = at::argsort(flat_e, 0, false);  // stable not required: order inside an expert only permutes summation order
+  // STABLE sort: inside an expert the rows keep token order. With an unstable sort the row order inside an expert, and with it the rounding of the grouped GEMMs and of the combine, changed
+  // from one forward to the next on the same input (measured on Super: the same micro-batch gave two different sets of logprobs, 5 to 10 % of its tokens off by more than 1e-3 nat).
+  Tensor order = at::argsort(flat_e, /*stable=*/true, 0, false);
   Tensor tok = at::floor_divide(order, k);
   Tensor wsorted = w.reshape({-1}).index_select(0, order);
   Tensor counts = at::bincount(flat_e, {}, E).cpu();
@@ -462,7 +465,10 @@ Tensor moe_fwd(const Tensor& x, const Layer& L, const Ctx& c) {
   NVPOP();
   NVPUSH("moe combine");
   V = V * wsorted.unsqueeze(-1).to(V.scalar_type());
-  Tensor o = at::zeros({N, Lw}, torch::TensorOptions().dtype(w.scalar_type()).device(x.device())).index_add(0, tok, V.to(w.scalar_type())).to(c.adt);
+  // Combine = sum over the k slots of every token in a FIXED order (rows put back in token-major order, then a dense sum over the slot axis). The former index_add over `tok` (k addends per
+  // destination row) accumulates through atomics on CUDA: its summation order, hence its rounding, is not reproducible, and one flipped router near-tie downstream changes whole logprobs.
+  Tensor inv = at::argsort(order, /*stable=*/true, 0, false);   // order is a permutation: inv[flat slot] = sorted row
+  Tensor o = V.to(w.scalar_type()).index_select(0, inv).view({N, k, Lw}).sum(1).to(c.adt);
   NVPOP();
   NVPUSH("moe fc2");
   Tensor y = L.fc2.defined() ? lin(o, L.fc2, c) : o;
