@@ -48,8 +48,17 @@ typedef struct ncclWindow_vidmem* ncclWindow_t;
 // exports it from 2.30.4, but before 2.30.7 a nonblocking init with a missing
 // rank blocks instead of returning ncclInProgress, so reconfigure cannot honor
 // its timeout there.
+//
+// The >= 2.28.0 version gate does not hold for every NCCL release
+// satisfying it: the public libnccl-dev 2.28.3 package (NCCL_VERSION_CODE
+// 22803) does not declare ncclCommRevoke. cmake/External/nccl.cmake
+// verifies the symbol is actually present via check_symbol_exists and
+// defines NCCL_HAS_COMM_REVOKE_SYMBOL_PRESENT only when it is; require that
+// on top of the version check on non-ROCM builds (ROCM's build does not run
+// that check, so it keeps relying on the version gate alone).
 #if (defined(USE_ROCM) && NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 7)) || \
-    (!defined(USE_ROCM) && NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0))
+    (!defined(USE_ROCM) && NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0) && \
+     defined(NCCL_HAS_COMM_REVOKE_SYMBOL_PRESENT))
 #define NCCL_HAS_COMM_REVOKE
 #endif
 

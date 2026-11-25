@@ -246,7 +246,7 @@ void AdamW::step_single_tensor(
     auto beta2 = std::get<1>(options.betas());
 
     // Decay the first and second moment running average coefficient
-    exp_avg.mul_(beta1).add_(grad, 1 - beta1);
+    exp_avg.lerp_(grad, 1 - beta1);
     exp_avg_sq.mul_(beta2).addcmul_(grad, grad, 1 - beta2);
 
     if (capturable) {
@@ -269,14 +269,8 @@ void AdamW::step_single_tensor(
 
       // bias_correction{1,2} as device tensors, mirroring the capturable
       // branch of `_single_tensor_adam` exactly (no `.item()` anywhere).
-      auto bias_correction1 =
-          1 - torch::pow(
-                  torch::scalar_tensor(beta1, state.step_tensor().options()),
-                  state.step_tensor());
-      auto bias_correction2 =
-          1 - torch::pow(
-                  torch::scalar_tensor(beta2, state.step_tensor().options()),
-                  state.step_tensor());
+      auto bias_correction1 = 1 - torch::pow(beta1, state.step_tensor());
+      auto bias_correction2 = 1 - torch::pow(beta2, state.step_tensor());
       auto step_size = options.lr() / bias_correction1;
       auto step_size_neg = -step_size;
       auto bias_correction2_sqrt = bias_correction2.sqrt();

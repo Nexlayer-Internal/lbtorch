@@ -8,6 +8,21 @@ if(NOT __NCCL_INCLUDED)
       add_library(__caffe2_nccl INTERFACE)
       target_link_libraries(__caffe2_nccl INTERFACE ${NCCL_LIBRARIES})
       target_include_directories(__caffe2_nccl INTERFACE ${NCCL_INCLUDE_DIRS})
+
+      # torch/csrc/distributed/c10d/nccl2/NcclApi.hpp gates ncclCommRevoke on
+      # NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0), but that gate does not
+      # hold for every NCCL release satisfying it: the public libnccl-dev
+      # 2.28.3 package does not declare ncclCommRevoke despite reporting
+      # NCCL_VERSION_CODE 22803. Verify the symbol is actually declared by
+      # this build's NCCL headers rather than trusting the version check
+      # alone, and make that verified fact available to NcclApi.hpp.
+      include(CheckSymbolExists)
+      set(CMAKE_REQUIRED_INCLUDES ${NCCL_INCLUDE_DIRS})
+      check_symbol_exists(ncclCommRevoke "nccl.h" NCCL_HAS_COMM_REVOKE_SYMBOL)
+      unset(CMAKE_REQUIRED_INCLUDES)
+      if(NCCL_HAS_COMM_REVOKE_SYMBOL)
+        target_compile_definitions(__caffe2_nccl INTERFACE NCCL_HAS_COMM_REVOKE_SYMBOL_PRESENT)
+      endif()
     endif()
   else()
     # cmake/PreBuildSteps.cmake clones NCCL from the pinned tag when the pin is

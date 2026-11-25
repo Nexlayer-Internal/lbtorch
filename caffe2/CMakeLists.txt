@@ -780,6 +780,7 @@ if(NOT NO_API AND NOT BUILD_LITE_INTERPRETER)
     ${TORCH_SRC_DIR}/csrc/api/src/nn/options/rnn.cpp
     ${TORCH_SRC_DIR}/csrc/api/src/nn/options/vision.cpp
     ${TORCH_SRC_DIR}/csrc/api/src/nn/options/transformer.cpp
+    ${TORCH_SRC_DIR}/csrc/api/src/models/qwen3.cpp
     ${TORCH_SRC_DIR}/csrc/api/src/optim/adagrad.cpp
     ${TORCH_SRC_DIR}/csrc/api/src/optim/adam.cpp
     ${TORCH_SRC_DIR}/csrc/api/src/optim/adamw.cpp
@@ -796,6 +797,7 @@ if(NOT NO_API AND NOT BUILD_LITE_INTERPRETER)
     ${TORCH_SRC_DIR}/csrc/api/src/serialize/output-archive.cpp
     ${TORCH_SRC_DIR}/csrc/api/src/print.cpp
     ${TORCH_SRC_DIR}/csrc/api/src/utils/checkpoint.cpp
+    ${TORCH_SRC_DIR}/csrc/api/src/utils/safetensors.cpp
     ${TORCH_SRC_DIR}/csrc/api/src/xpu.cpp
   )
 endif()
