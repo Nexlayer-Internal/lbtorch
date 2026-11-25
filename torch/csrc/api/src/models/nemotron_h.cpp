@@ -362,6 +362,26 @@ Tensor attn_fwd(const Tensor& x, const Layer& L, const Ctx& c, const LayerState*
   return lin(o.transpose(1, 2).reshape({B, T, nH * hd}), L.o_proj, c);
 }
 
+// Routed experts on a dequantised stack as ONE autograd node: V = relu(xs Wu^T)^2 Wd^T per expert segment (two grouped GEMMs), frozen weights.
+// Saves only r = relu(xs Wu^T) (written in place of the first product). Backward: d(xs) = ((2 gV) Wd * r) Wu: two grouped GEMMs and ONE in-place elementwise pass, instead of
+// the composed graph's three full-size passes (square, mask, scale) with their temporaries. The factor 2 is applied to gV (a power of two commutes with the bf16 rounding of
+// the product), so the values equal the composed graph's.
+struct ExpertsFn : public torch::autograd::Function<ExpertsFn> {
+  static Tensor forward(AutogradContext* ctx, const Tensor& xs, const Tensor& Wu, const Tensor& Wd, const Tensor& offs) {
+    Tensor r = at::_grouped_mm(xs, Wu.transpose(1, 2), offs);
+    r.relu_();
+    Tensor V = at::_grouped_mm(r.square(), Wd.transpose(1, 2), offs);
+    ctx->save_for_backward({r, Wu, Wd, offs});
+    return V;
+  }
+  static variable_list backward(AutogradContext* ctx, variable_list go) {
+    auto s = ctx->get_saved_variables();
+    Tensor da = at::_grouped_mm(go[0] * 2.0, s[2], s[3]);
+    da.mul_(s[0]);
+    return {at::_grouped_mm(da, s[1], s[3]), Tensor(), Tensor(), Tensor()};
+  }
+};
+
 // ---------------------------------------------------------------------------------------------------------------------------------------------
 // MoE: router (fp32), routed experts in the latent, shared expert
 // ---------------------------------------------------------------------------------------------------------------------------------------------
@@ -414,14 +434,13 @@ Tensor moe_fwd(const Tensor& x, const Layer& L, const Ctx& c) {
     V = at::_grouped_mm(relu2(u), Wd.transpose(1, 2), offs);
   } else if (c.o->dequant && L.up.fmt != QFormat::Dense && L.down.fmt != QFormat::Dense && xs.is_cuda()) {
     // quantised experts with a device dequant kernel: the whole stack in one launch per projection, then one grouped GEMM per projection. The backward is two grouped GEMMs
-    // (derivative of _grouped_mm), so nothing is O(experts x tokens) any more (the loop's narrow() backward materialises a full-size zero tensor per expert).
+    // (ExpertsFn), so nothing is O(experts x tokens) any more (the loop's narrow() backward materialises a full-size zero tensor per expert).
     NVPUSH("expert dequant");
     Tensor Wu = c.o->dequant(L.up, c.adt), Wd = c.o->dequant(L.down, c.adt);   // [E,I,L], [E,L,I]
     NVPOP();
     NVPUSH("expert gemm");
     Tensor offs = at::cumsum(counts, 0).to(torch::kInt32).to(x.device());
-    Tensor u = at::_grouped_mm(xs, Wu.transpose(1, 2), offs);
-    V = at::_grouped_mm(relu2(u), Wd.transpose(1, 2), offs);
+    V = ExpertsFn::apply(xs, Wu, Wd, offs);
     NVPOP();
   } else {
     std::vector<Tensor> outs;
