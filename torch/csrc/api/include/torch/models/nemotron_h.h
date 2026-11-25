@@ -140,6 +140,14 @@ enum class MoeImpl { Loop, GroupedMM };
 /// QWeight::dequant. Unset: QWeight::dequant (pure ATen; the CPU path and the reference). With the hook set, quantised routed experts are dequantised as ONE stack per MoE layer
 /// and run through at::_grouped_mm (one grouped GEMM per projection, forward and backward) instead of the per-expert loop.
 using DequantFn = std::function<Tensor(const QWeight& q, ScalarType dt)>;
+/// LoRA-branch hook (fused kernel supplied by the trainer): y [..., out] base output and x [..., in] the linear's input, both in the activation dtype; A [r,in], B [out,r] leaves
+/// -> the activation-dtype value of  y + scale * ((x @ A^T) @ B^T)  with the adapter applied in fp32 (PEFT semantics). Unset: the ATen expression in lin() (fp32 [.., out] temporaries).
+using LoraFn = std::function<Tensor(const Tensor& y, const Tensor& x, const Tensor& A, const Tensor& B, double scale)>;
+/// Packed-layout SSD hook on the un-expanded inputs (replaces SsdFn for the packed mixers when set): x [T,H,P], B / C [T,G,N] in the activation dtype (one row of B / C per
+/// group, NOT repeated per head), dt [T,H], A [H], D [H] fp32, h0 [Nseq,H,P,N] fp32 or undefined, cu_seqlens int32 [Nseq+1] (CPU) -> {y [T,H,P] activation dtype, final states
+/// [Nseq,H,P,N] fp32}. Same function as SsdFn applied to the per-head expansion (the expansion is a copy: the values are identical), without the fp32 [T,H,N] temporaries.
+using SsdPackedFn = std::function<std::pair<Tensor, Tensor>(const Tensor& x, const Tensor& dt, const Tensor& A, const Tensor& Bg, const Tensor& Cg, const Tensor& D,
+                                                             const Tensor& h0, int64_t chunk, const Tensor& cu_seqlens)>;
 
 struct TORCH_API ForwardOptions {
   Compute compute = Compute::BF16;
@@ -149,6 +157,8 @@ struct TORCH_API ForwardOptions {
   SsdFn ssd;                // default ssd_aten
   AttnFn attn;              // packed layout only (block_fwd / mixer_fwd); default per-sequence SDPA
   DequantFn dequant;        // default QWeight::dequant; see DequantFn
+  LoraFn lora;              // default: ATen fp32 adapter; see LoraFn
+  SsdPackedFn ssd_packed;   // packed mixers only; wins over `ssd` when set; see SsdPackedFn
   Probe* probe = nullptr;
   const std::vector<LayerState>* state_in = nullptr;  // per layer; undefined tensors = no prefix
   std::vector<LayerState>* state_out = nullptr;       // filled (graph-connected) when non-null

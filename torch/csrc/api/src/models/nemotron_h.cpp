@@ -117,6 +117,7 @@ Tensor lin(const Tensor& x, const Linear& L, const Ctx& c) {
   NVPUSH("lora");
   struct Pop { ~Pop() { nvtxRangePop(); } } pop_;
   if (L.lora.defined()) {
+    if (c.o->lora) return c.o->lora(y, x, L.lora.A, L.lora.B, L.lora.scale);
     Tensor d = at::linear(at::linear(x.to(c.sdt), L.lora.A.to(c.sdt)), L.lora.B.to(c.sdt)) * L.lora.scale;
     y = (y.to(c.sdt) + d).to(c.adt);
   }
@@ -498,13 +499,23 @@ Tensor mamba_packed_seg(const Tensor& h, const Layer& L, const Ctx& c, const std
   c10::optional<c10::Scalar> mn = c10::Scalar(cf.dt_clamp_min), mx;
   if (std::isfinite(cf.dt_clamp_max)) mx = c10::Scalar(cf.dt_clamp_max);
   dt = at::clamp(dt, mn, mx);
-  Tensor xs = hs.reshape({1, Ts, H, P}).to(c.sdt);
-  Tensor Bh = Bm.reshape({1, Ts, G, N}).to(c.sdt).repeat_interleave(H / G, 2);
-  Tensor Ch = Cm.reshape({1, Ts, G, N}).to(c.sdt).repeat_interleave(H / G, 2);
   Tensor cu = cu_of(lens);
-  NVPOP();
-  NVPUSH("mamba ssd");
-  auto yst = c.o->ssd ? c.o->ssd(xs, dt, A, Bh, Ch, L.D.to(c.sdt), h0, cf.chunk_size, cu) : ssd_aten(xs, dt, A, Bh, Ch, L.D.to(c.sdt), h0, cf.chunk_size, cu);
+  std::pair<Tensor, Tensor> yst;
+  if (c.o->ssd_packed) {
+    // un-expanded inputs in the activation dtype (no fp32 [T,H,N] copies of B / C, no fp32 copy of x); y comes back in the activation dtype and is widened for the gated norm,
+    // exactly the values the SsdFn path produces (its kernel output is the same bf16 tensor cast to fp32)
+    NVPOP();
+    NVPUSH("mamba ssd");
+    yst = c.o->ssd_packed(hs.reshape({Ts, H, P}), dt.reshape({Ts, H}), A, Bm.reshape({Ts, G, N}), Cm.reshape({Ts, G, N}), L.D.to(c.sdt), h0, cf.chunk_size, cu);
+    yst.first = yst.first.to(c.sdt);
+  } else {
+    Tensor xs = hs.reshape({1, Ts, H, P}).to(c.sdt);
+    Tensor Bh = Bm.reshape({1, Ts, G, N}).to(c.sdt).repeat_interleave(H / G, 2);
+    Tensor Ch = Cm.reshape({1, Ts, G, N}).to(c.sdt).repeat_interleave(H / G, 2);
+    NVPOP();
+    NVPUSH("mamba ssd");
+    yst = c.o->ssd ? c.o->ssd(xs, dt, A, Bh, Ch, L.D.to(c.sdt), h0, cf.chunk_size, cu) : ssd_aten(xs, dt, A, Bh, Ch, L.D.to(c.sdt), h0, cf.chunk_size, cu);
+  }
   NVPOP();
   NVPUSH("mamba gnorm");
   if (ssm_out) *ssm_out = yst.second;
