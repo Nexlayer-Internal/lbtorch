@@ -1,6 +1,7 @@
 #include <torch/models/nemotron_h.h>
 
 #include <torch/torch.h>
+#include <nvtx3/nvToolsExt.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -23,6 +24,10 @@
 namespace torch::models::nemotron_h {
 
 namespace {
+// profiling ranges (no-ops unless nsys/ncu is attached)
+#define NVPUSH(s) nvtxRangePushA(s)
+#define NVPOP() nvtxRangePop()
+struct NvScope { explicit NvScope(const std::string& s) { nvtxRangePushA(s.c_str()); } ~NvScope() { nvtxRangePop(); } };
 using torch::autograd::AutogradContext;
 using torch::autograd::variable_list;
 constexpr auto kF = torch::kFloat32;
@@ -44,6 +49,9 @@ struct Ctx {
 };
 
 Tensor relu2(const Tensor& x) { return at::relu(x).square(); }
+
+// frozen weight -> dense compute dtype: the trainer's device kernel when supplied (ForwardOptions::dequant), the ATen reference otherwise
+Tensor dq(const QWeight& q, const Ctx& c) { return (c.o->dequant && q.fmt != QFormat::Dense) ? c.o->dequant(q, c.adt) : q.dequant(c.adt); }
 
 // NemotronHRMSNorm: fp32 statistics, weight * x.to(input dtype)
 Tensor rms(const Tensor& x, const Tensor& w, double eps) {
@@ -99,7 +107,15 @@ struct ActQuantSTE : public torch::autograd::Function<ActQuantSTE> {
 Tensor lin(const Tensor& x, const Linear& L, const Ctx& c) {
   Tensor xin = x;
   if (c.o->act_quant && L.q.fmt != QFormat::Dense && L.q.input_scale.defined()) xin = act_quant_ste(x, L.q);
-  Tensor y = at::linear(xin, L.q.dequant(c.adt));
+  NvScope nv_("lin " + L.name);
+  NVPUSH("dequant");
+  Tensor wd = dq(L.q, c);
+  NVPOP();
+  NVPUSH("base gemm");
+  Tensor y = at::linear(xin, wd);
+  NVPOP();
+  NVPUSH("lora");
+  struct Pop { ~Pop() { nvtxRangePop(); } } pop_;
   if (L.lora.defined()) {
     Tensor d = at::linear(at::linear(x.to(c.sdt), L.lora.A.to(c.sdt)), L.lora.B.to(c.sdt)) * L.lora.scale;
     y = (y.to(c.sdt) + d).to(c.adt);
@@ -355,6 +371,7 @@ Tensor moe_fwd(const Tensor& x, const Layer& L, const Ctx& c) {
   Tensor xf = x.reshape({-1, x.size(-1)});
   const int64_t N = xf.size(0);
   // ---- router (NemotronHTopkRouter): logits in fp32; the selection is integer, the weights come from `scores` WITHOUT the bias and stay in the graph
+  NVPUSH("moe router");
   Tensor xr = xf.to(c.sdt);
   Tensor logits = at::linear(xr, L.gate_w.to(c.sdt));
   if (L.gate_lora.defined()) logits = logits + at::linear(at::linear(xr, L.gate_lora.A.to(c.sdt)), L.gate_lora.B.to(c.sdt)) * L.gate_lora.scale;
@@ -373,8 +390,11 @@ Tensor moe_fwd(const Tensor& x, const Layer& L, const Ctx& c) {
   Tensor w = scores.gather(1, idx);
   if (cf.norm_topk_prob) w = w / (w.sum(-1, true) + 1e-20);
   w = w * cf.routed_scaling_factor;  // [N,k] fp32/fp64, in graph
-  // ---- latent projection + routed experts
+  NVPOP();
+  NVPUSH("moe fc1");
   Tensor zl = L.fc1.defined() ? lin(xf, L.fc1, c) : xf;
+  NVPOP();
+  NVPUSH("moe sort");
   const int64_t Lw = zl.size(-1);
   Tensor flat_e = idx.reshape({-1});
   Tensor order = at::argsort(flat_e, 0, false);  // stable not required: order inside an expert only permutes summation order
@@ -382,6 +402,8 @@ Tensor moe_fwd(const Tensor& x, const Layer& L, const Ctx& c) {
   Tensor wsorted = w.reshape({-1}).index_select(0, order);
   Tensor counts = at::bincount(flat_e, {}, E).cpu();
   Tensor xs = zl.index_select(0, tok);
+  NVPOP();
+  NVPUSH("moe experts");
   Tensor V;
   if (c.o->moe == MoeImpl::GroupedMM) {
     TORCH_CHECK(L.up.fmt == QFormat::Dense, "nemotron_h: GroupedMM needs dense stacked experts (quantised experts use the per-expert loop)");
@@ -389,6 +411,17 @@ Tensor moe_fwd(const Tensor& x, const Layer& L, const Ctx& c) {
     Tensor Wu = L.up.dequant(c.adt), Wd = L.down.dequant(c.adt);
     Tensor u = at::_grouped_mm(xs, Wu.transpose(1, 2), offs);
     V = at::_grouped_mm(relu2(u), Wd.transpose(1, 2), offs);
+  } else if (c.o->dequant && L.up.fmt != QFormat::Dense && L.down.fmt != QFormat::Dense && xs.is_cuda()) {
+    // quantised experts with a device dequant kernel: the whole stack in one launch per projection, then one grouped GEMM per projection. The backward is two grouped GEMMs
+    // (derivative of _grouped_mm), so nothing is O(experts x tokens) any more (the loop's narrow() backward materialises a full-size zero tensor per expert).
+    NVPUSH("expert dequant");
+    Tensor Wu = c.o->dequant(L.up, c.adt), Wd = c.o->dequant(L.down, c.adt);   // [E,I,L], [E,L,I]
+    NVPOP();
+    NVPUSH("expert gemm");
+    Tensor offs = at::cumsum(counts, 0).to(torch::kInt32).to(x.device());
+    Tensor u = at::_grouped_mm(xs, Wu.transpose(1, 2), offs);
+    V = at::_grouped_mm(relu2(u), Wd.transpose(1, 2), offs);
+    NVPOP();
   } else {
     std::vector<Tensor> outs;
     int64_t off = 0;
@@ -396,15 +429,27 @@ Tensor moe_fwd(const Tensor& x, const Layer& L, const Ctx& c) {
     for (int64_t e = 0; e < E; ++e) {
       if (cn[e] == 0) continue;
       Tensor seg = xs.narrow(0, off, cn[e]);
-      outs.push_back(at::linear(relu2(at::linear(seg, L.up.at(e).dequant(c.adt))), L.down.at(e).dequant(c.adt)));
+      NVPUSH("expert dequant");
+      Tensor wu = L.up.at(e).dequant(c.adt), wd = L.down.at(e).dequant(c.adt);
+      NVPOP();
+      NVPUSH("expert gemm");
+      outs.push_back(at::linear(relu2(at::linear(seg, wu)), wd));
+      NVPOP();
       off += cn[e];
     }
     V = at::cat(outs, 0);
   }
+  NVPOP();
+  NVPUSH("moe combine");
   V = V * wsorted.unsqueeze(-1).to(V.scalar_type());
   Tensor o = at::zeros({N, Lw}, torch::TensorOptions().dtype(w.scalar_type()).device(x.device())).index_add(0, tok, V.to(w.scalar_type())).to(c.adt);
+  NVPOP();
+  NVPUSH("moe fc2");
   Tensor y = L.fc2.defined() ? lin(o, L.fc2, c) : o;
+  NVPOP();
+  NVPUSH("moe shared");
   y = y + lin(relu2(lin(xf, L.sh_up, c)), L.sh_down, c);
+  NVPOP();
   return y.reshape(shp);
 }
 
@@ -426,6 +471,7 @@ Tensor mamba_packed_seg(const Tensor& h, const Layer& L, const Ctx& c, const std
   const int64_t Ts = h.size(1), H = cf.mamba_num_heads, P = cf.mamba_head_dim, N = cf.ssm_state_size, G = cf.n_groups, K = cf.conv_kernel;
   const int64_t di = cf.d_inner(), cd = cf.conv_dim();
   Tensor proj = lin(h, L.in_proj, c);
+  NVPUSH("mamba conv+prep");
   const int64_t d_mlp = (proj.size(-1) - 2 * di - 2 * G * N - H) / 2;
   Tensor z = proj.narrow(-1, 2 * d_mlp, di);
   Tensor xBC = proj.narrow(-1, 2 * d_mlp + di, cd).transpose(1, 2);   // [1,cd,Ts]
@@ -456,10 +502,15 @@ Tensor mamba_packed_seg(const Tensor& h, const Layer& L, const Ctx& c, const std
   Tensor Bh = Bm.reshape({1, Ts, G, N}).to(c.sdt).repeat_interleave(H / G, 2);
   Tensor Ch = Cm.reshape({1, Ts, G, N}).to(c.sdt).repeat_interleave(H / G, 2);
   Tensor cu = cu_of(lens);
+  NVPOP();
+  NVPUSH("mamba ssd");
   auto yst = c.o->ssd ? c.o->ssd(xs, dt, A, Bh, Ch, L.D.to(c.sdt), h0, cf.chunk_size, cu) : ssd_aten(xs, dt, A, Bh, Ch, L.D.to(c.sdt), h0, cf.chunk_size, cu);
+  NVPOP();
+  NVPUSH("mamba gnorm");
   if (ssm_out) *ssm_out = yst.second;
   Tensor y = yst.first.reshape({1, Ts, di});
   Tensor g = rms_gated_grouped(y, z, L.gnorm, G, cf.norm_eps).to(c.adt);
+  NVPOP();
   return lin(g, L.out_proj, c);
 }
 
@@ -813,11 +864,13 @@ Tensor Model::lm_logits(const Tensor& hn, const ForwardOptions& opt) {
 Tensor Model::forward_embeds(const Tensor& embeds, const ForwardOptions& opt) { return lm_logits(forward_hidden(embeds, opt), opt); }
 
 // ---- block-level API (packed [T, hidden] layout)
-Tensor Model::norm_fwd(int64_t block, const Tensor& x, Compute) const { return rms(x, layers.at(block).norm, cfg.norm_eps); }
+Tensor Model::norm_fwd(int64_t block, const Tensor& x, Compute) const { NvScope nv_("NORM"); return rms(x, layers.at(block).norm, cfg.norm_eps); }
 
 Tensor Model::mixer_fwd(int64_t block, const Tensor& h, const SeqLayout& lay, const ForwardOptions& opt) const {
   Ctx c{compute_dtype(opt.compute), stable_dt(compute_dtype(opt.compute)), &opt, &cfg};
   TORCH_CHECK(layer_loaded(block), "nemotron_h: block ", block, " is not loaded");
+  static const char* tn[] = {"Mamba", "Attention", "MoE", "MLP"};
+  NvScope nv_(std::string("MIXER ") + std::to_string(block) + " " + tn[static_cast<int>(layers[block].type)]);
   return mixer_packed(layers[block], h, lay, c);
 }
 
@@ -829,6 +882,7 @@ Tensor Model::final_norm_fwd(const Tensor& h, Compute) const { return rms(h, fin
 
 Tensor Model::head_logprob(const Tensor& hn, const Tensor& tgt, const ForwardOptions& opt) const {
   Ctx c{compute_dtype(opt.compute), stable_dt(compute_dtype(opt.compute)), &opt, &cfg};
+  NvScope nv_("HEAD");
   Tensor logits = lin(hn, lm_head, c).to(c.sdt);   // bf16 mode: bf16 GEMM, then fp32 (as HF); the [C, V] chunk is the only logits tensor that ever exists
   return logits.gather(1, tgt.unsqueeze(1)).squeeze(1) - at::logsumexp(logits, 1);
 }

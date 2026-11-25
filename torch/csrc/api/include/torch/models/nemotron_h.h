@@ -136,6 +136,11 @@ TORCH_API Tensor act_quant_ste(const Tensor& x, const QWeight& w);
 
 enum class MoeImpl { Loop, GroupedMM };
 
+/// Dequantisation hook (device kernel supplied by the trainer): a quantised QWeight (single weight or a stack of experts) -> dense [..., out, in] in `dt`, bit-identical to
+/// QWeight::dequant. Unset: QWeight::dequant (pure ATen; the CPU path and the reference). With the hook set, quantised routed experts are dequantised as ONE stack per MoE layer
+/// and run through at::_grouped_mm (one grouped GEMM per projection, forward and backward) instead of the per-expert loop.
+using DequantFn = std::function<Tensor(const QWeight& q, ScalarType dt)>;
+
 struct TORCH_API ForwardOptions {
   Compute compute = Compute::BF16;
   bool checkpoint = false;  // per-layer reentrant checkpointing; not combinable with state_in/state_out
@@ -143,6 +148,7 @@ struct TORCH_API ForwardOptions {
   MoeImpl moe = MoeImpl::Loop;
   SsdFn ssd;                // default ssd_aten
   AttnFn attn;              // packed layout only (block_fwd / mixer_fwd); default per-sequence SDPA
+  DequantFn dequant;        // default QWeight::dequant; see DequantFn
   Probe* probe = nullptr;
   const std::vector<LayerState>* state_in = nullptr;  // per layer; undefined tensors = no prefix
   std::vector<LayerState>* state_out = nullptr;       // filled (graph-connected) when non-null
