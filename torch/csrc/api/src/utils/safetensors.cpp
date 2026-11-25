@@ -39,6 +39,8 @@ torch::ScalarType DtypeFromSafetensors(const std::string& s) {
     return torch::kInt8;
   if (s == "U8")
     return torch::kUInt8;
+  if (s == "F8_E4M3")
+    return torch::kFloat8_e4m3fn;
   if (s == "BOOL")
     return torch::kBool;
   TORCH_CHECK(false, "safetensors: unsupported dtype string '", s, "'");
