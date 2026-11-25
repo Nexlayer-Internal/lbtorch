@@ -569,6 +569,7 @@ Config Config::FromFile(const std::string& path) {
 
 QWeight load_qweight(const utils::safetensors::SafetensorsCollection& coll, const std::string& base, torch::Device dev, torch::ScalarType dense_dtype) {
   QWeight q;
+  q.present = true;
   const std::string wn = base + ".weight";
   const auto dt = coll.dtype(wn);
   if (dt == torch::kUInt8) {
@@ -576,16 +577,18 @@ QWeight load_qweight(const utils::safetensors::SafetensorsCollection& coll, cons
     q.w = coll.get(wn, torch::kUInt8, dev);
     q.scale = coll.get(base + ".weight_scale", torch::kFloat8_e4m3fn, dev);
     q.scale2 = coll.get(base + ".weight_scale_2", kF, dev);
+    q.has_scale = q.has_scale2 = true;
   } else if (dt == torch::kFloat8_e4m3fn) {
     q.fmt = QFormat::FP8;
     q.w = coll.get(wn, torch::kFloat8_e4m3fn, dev);
     q.scale2 = coll.get(base + ".weight_scale", kF, dev);
+    q.has_scale2 = true;
   } else {
     q.fmt = QFormat::Dense;
     q.w = coll.get(wn, dense_dtype, dev);
     return q;
   }
-  if (coll.has(base + ".input_scale")) q.input_scale = coll.get(base + ".input_scale", kF, dev);
+  if (coll.has(base + ".input_scale")) { q.input_scale = coll.get(base + ".input_scale", kF, dev); q.has_input_scale = true; }
   return q;
 }
 
@@ -594,12 +597,14 @@ QWeight load_experts(const utils::safetensors::SafetensorsCollection& coll, cons
                      torch::ScalarType dd) {
   if (!coll.has(prefix + ".0." + which + ".weight")) {  // HF-stacked layout: experts.up_proj [E,out,in]
     QWeight q;
+    q.present = true;
     q.w = coll.get(prefix + "." + which, dd, dev);
     return q;
   }
   std::vector<QWeight> v;
   for (int64_t e = 0; e < E; ++e) v.push_back(load_qweight(coll, prefix + "." + std::to_string(e) + "." + which, dev, dd));
   QWeight q;
+  q.present = true; q.has_scale = v[0].has_scale; q.has_scale2 = v[0].has_scale2; q.has_input_scale = v[0].has_input_scale;
   q.fmt = v[0].fmt;
   auto stack = [&](Tensor QWeight::*m) {
     if (!(v[0].*m).defined()) return Tensor();
@@ -649,7 +654,7 @@ Model Model::Load(const std::string& dir, torch::Device device, const LoadOpts& 
       case BlockType::Mamba:
         mk(L.in_proj, "in_proj", Shard::Column); mk(L.out_proj, "out_proj", Shard::Row);
         L.conv_w = W(mx + "conv1d.weight");
-        if (coll.has(mx + "conv1d.bias")) L.conv_b = W(mx + "conv1d.bias");
+        if (coll.has(mx + "conv1d.bias")) { L.conv_b = W(mx + "conv1d.bias"); L.has_conv_b = true; }
         L.A_log = W(mx + "A_log"); L.D = W(mx + "D"); L.dt_bias = W(mx + "dt_bias"); L.gnorm = W(mx + "norm.weight");
         break;
       case BlockType::Attention:
@@ -734,11 +739,11 @@ std::vector<WeightSlot> Model::base_slots() {
   std::vector<WeightSlot> v;
   const int64_t n = static_cast<int64_t>(layers.size());
   auto addq = [&](const std::string& name, QWeight& q, int g) {
-    if (!q.defined()) return;
+    if (!q.slot_w()) return;   // structure comes from what the loader recorded, so the list is the same before and after the slots are emptied (park, spill level 2)
     v.push_back({name + ".weight", &q.w, static_cast<int>(q.fmt), g});
-    if (q.scale.defined()) v.push_back({name + ".weight_scale", &q.scale, 5, g});
-    if (q.scale2.defined()) v.push_back({name + (q.fmt == QFormat::NVFP4 ? ".weight_scale_2" : ".weight_scale"), &q.scale2, 6, g});
-    if (q.input_scale.defined()) v.push_back({name + ".input_scale", &q.input_scale, 6, g});
+    if (q.slot_scale()) v.push_back({name + ".weight_scale", &q.scale, 5, g});
+    if (q.slot_scale2()) v.push_back({name + (q.fmt == QFormat::NVFP4 ? ".weight_scale_2" : ".weight_scale"), &q.scale2, 6, g});
+    if (q.slot_input_scale()) v.push_back({name + ".input_scale", &q.input_scale, 6, g});
   };
   v.push_back({"embeddings.weight", &embed, 0, 0});
   for (int64_t i = 0; i < n; ++i) {
@@ -751,14 +756,14 @@ std::vector<WeightSlot> Model::base_slots() {
       case BlockType::Mamba:
         addl(L.in_proj); addl(L.out_proj);
         v.push_back({p + "mixer.conv1d.weight", &L.conv_w, 0, g});
-        if (L.conv_b.defined()) v.push_back({p + "mixer.conv1d.bias", &L.conv_b, 0, g});
+        if (L.has_conv_b || L.conv_b.defined()) v.push_back({p + "mixer.conv1d.bias", &L.conv_b, 0, g});
         v.push_back({p + "mixer.A_log", &L.A_log, 0, g}); v.push_back({p + "mixer.D", &L.D, 0, g});
         v.push_back({p + "mixer.dt_bias", &L.dt_bias, 0, g}); v.push_back({p + "mixer.norm.weight", &L.gnorm, 0, g});
         break;
       case BlockType::Attention: addl(L.q_proj); addl(L.k_proj); addl(L.v_proj); addl(L.o_proj); break;
       case BlockType::MoE:
         v.push_back({p + "mixer.gate.weight", &L.gate_w, 0, g}); v.push_back({p + "mixer.gate.e_score_correction_bias", &L.gate_bias, 0, g});
-        if (L.fc1.defined()) { addl(L.fc1); addl(L.fc2); }
+        if (L.fc1.q.slot_w()) { addl(L.fc1); addl(L.fc2); }
         addl(L.sh_up); addl(L.sh_down);
         addq(p + "mixer.experts.up_proj", L.up, g); addq(p + "mixer.experts.down_proj", L.down, g);  // stacked [E, ...]
         break;

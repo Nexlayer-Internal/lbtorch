@@ -63,6 +63,13 @@ struct TORCH_API QWeight {
   Tensor scale;        // NVFP4: float8_e4m3fn [..,out,in/16] block scales
   Tensor scale2;       // NVFP4: fp32 weight_scale_2; FP8: fp32 weight_scale (scalar, or [E] when stacked)
   Tensor input_scale;  // fp32 activation scale (optional; used by the activation quantiser)
+  // Structure recorded by the loader. base_slots() must list the SAME slots whether the tensors are resident or not (park / spill level 2 empty them, and the trainer restores by slot index),
+  // so presence cannot be read off Tensor::defined(). A QWeight built by hand (tests) keeps the old behaviour: a defined tensor counts as present.
+  bool present = false, has_scale = false, has_scale2 = false, has_input_scale = false;
+  bool slot_w() const { return present || w.defined(); }
+  bool slot_scale() const { return has_scale || scale.defined(); }
+  bool slot_scale2() const { return has_scale2 || scale2.defined(); }
+  bool slot_input_scale() const { return has_input_scale || input_scale.defined(); }
   bool defined() const { return w.defined(); }
   int64_t out_features() const { return w.size(-2); }
   int64_t in_features() const { return fmt == QFormat::NVFP4 ? w.size(-1) * 2 : w.size(-1); }
@@ -92,6 +99,7 @@ struct TORCH_API Layer {
   // mamba2
   Linear in_proj, out_proj;
   Tensor conv_w, conv_b;           // [conv_dim,1,K], [conv_dim]
+  bool has_conv_b = false;         // set by the loader (the checkpoint has a conv bias); independent of whether conv_b is resident
   Tensor A_log, D, dt_bias;        // [H]
   Tensor gnorm;                    // [d_inner] gated grouped RMSNorm weight
   // attention
