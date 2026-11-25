@@ -3,6 +3,7 @@
 #include <torch/torch.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <sstream>
@@ -132,9 +133,31 @@ Tensor segment_sum(const Tensor& t) {
 }
 }  // namespace
 
-std::pair<Tensor, Tensor> ssd_aten(const Tensor& x, const Tensor& dt, const Tensor& A, const Tensor& Bh, const Tensor& Ch, const Tensor& D, const Tensor& h0,
-                                   int64_t chunk, const Tensor& cu_seqlens) {
-  TORCH_CHECK(!cu_seqlens.defined(), "nemotron_h: ssd_aten has no varlen (cu_seqlens) support; use the batched layout or the AOT kernel");
+using SsdBatched = std::pair<Tensor, Tensor> (*)(const Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, int64_t);
+
+// Varlen contract of SsdFn on top of a batched implementation: x [1,T,H,P] packed, cu_seqlens int32 [N+1], h0 [N,H,P,N] or undefined -> y [1,T,H,P], final states [N,H,P,N].
+// Loops the sequences and carries h0[n] per sequence (the AOT kernel does this natively).
+std::pair<Tensor, Tensor> ssd_varlen_loop(SsdBatched f, const Tensor& x, const Tensor& dt, const Tensor& A, const Tensor& Bh, const Tensor& Ch, const Tensor& D, const Tensor& h0,
+                                          int64_t chunk, const Tensor& cu_seqlens) {
+  TORCH_CHECK(x.size(0) == 1, "nemotron_h: varlen SSD needs the packed layout [1,T,...]");
+  Tensor cu = cu_seqlens.to(torch::kCPU).to(torch::kInt64).contiguous();
+  const int64_t N = cu.numel() - 1;
+  const int64_t* c = cu.data_ptr<int64_t>();
+  TORCH_CHECK(c[N] == x.size(1), "nemotron_h: cu_seqlens does not cover the packed tokens");
+  std::vector<Tensor> ys, st;
+  for (int64_t n = 0; n < N; ++n) {
+    const int64_t s = c[n], len = c[n + 1] - c[n];
+    TORCH_CHECK(len > 0, "nemotron_h: empty sequence in cu_seqlens");
+    Tensor h0n = h0.defined() ? h0.narrow(0, n, 1) : Tensor();
+    auto r = f(x.narrow(1, s, len), dt.narrow(1, s, len), A, Bh.narrow(1, s, len), Ch.narrow(1, s, len), D, h0n, chunk);
+    ys.push_back(r.first);
+    st.push_back(r.second);
+  }
+  return {at::cat(ys, 1), at::cat(st, 0)};
+}
+
+namespace {
+std::pair<Tensor, Tensor> ssd_aten_b(const Tensor& x, const Tensor& dt, const Tensor& A, const Tensor& Bh, const Tensor& Ch, const Tensor& D, const Tensor& h0, int64_t chunk) {
   const int64_t b = x.size(0), l = x.size(1), h = x.size(2), p = x.size(3);
   const int64_t pad = (chunk - l % chunk) % chunk;
   Tensor D_res = D.unsqueeze(-1) * pad_seq(x, pad);
@@ -172,9 +195,7 @@ std::pair<Tensor, Tensor> ssd_aten(const Tensor& x, const Tensor& dt, const Tens
   return {y, ssm_state};
 }
 
-std::pair<Tensor, Tensor> ssd_serial(const Tensor& x, const Tensor& dt, const Tensor& A, const Tensor& Bh, const Tensor& Ch, const Tensor& D, const Tensor& h0,
-                                     int64_t /*chunk*/, const Tensor& cu_seqlens) {
-  TORCH_CHECK(!cu_seqlens.defined(), "nemotron_h: ssd_serial has no varlen (cu_seqlens) support");
+std::pair<Tensor, Tensor> ssd_serial_b(const Tensor& x, const Tensor& dt, const Tensor& A, const Tensor& Bh, const Tensor& Ch, const Tensor& D, const Tensor& h0, int64_t /*chunk*/) {
   const int64_t T = x.size(1);
   Tensor state = h0.defined() ? h0.to(x.scalar_type()) : at::zeros({x.size(0), x.size(2), x.size(3), Bh.size(3)}, x.options());
   std::vector<Tensor> ys;
@@ -185,6 +206,18 @@ std::pair<Tensor, Tensor> ssd_serial(const Tensor& x, const Tensor& dt, const Te
     ys.push_back((state * Ch.select(1, t).unsqueeze(2)).sum(-1) + D.unsqueeze(-1) * xt);
   }
   return {at::stack(ys, 1), state};
+}
+}  // namespace
+
+std::pair<Tensor, Tensor> ssd_aten(const Tensor& x, const Tensor& dt, const Tensor& A, const Tensor& Bh, const Tensor& Ch, const Tensor& D, const Tensor& h0, int64_t chunk,
+                                   const Tensor& cu_seqlens) {
+  if (cu_seqlens.defined()) return ssd_varlen_loop(&ssd_aten_b, x, dt, A, Bh, Ch, D, h0, chunk, cu_seqlens);
+  return ssd_aten_b(x, dt, A, Bh, Ch, D, h0, chunk);
+}
+std::pair<Tensor, Tensor> ssd_serial(const Tensor& x, const Tensor& dt, const Tensor& A, const Tensor& Bh, const Tensor& Ch, const Tensor& D, const Tensor& h0, int64_t chunk,
+                                     const Tensor& cu_seqlens) {
+  if (cu_seqlens.defined()) return ssd_varlen_loop(&ssd_serial_b, x, dt, A, Bh, Ch, D, h0, chunk, cu_seqlens);
+  return ssd_serial_b(x, dt, A, Bh, Ch, D, h0, chunk);
 }
 
 Tensor act_quant_ste(const Tensor& x, const QWeight& w) {
@@ -377,6 +410,103 @@ Tensor moe_fwd(const Tensor& x, const Layer& L, const Ctx& c) {
 
 Tensor mlp_fwd(const Tensor& x, const Layer& L, const Ctx& c) { return lin(relu2(lin(x, L.sh_up, c)), L.sh_down, c); }
 
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// packed-token mixers (the trainer's layout: [T, hidden] rows, sequences concatenated)
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+Tensor cu_of(const std::vector<int64_t>& lens) {
+  std::vector<int32_t> v(1, 0);
+  for (int64_t l : lens) v.push_back(v.back() + static_cast<int32_t>(l));
+  return torch::tensor(v, torch::kInt32);
+}
+
+// One segment of a packed batch: h [1,Ts,hidden] holds sequences `lens`. h0 [N,H,P,N] / conv_ctx [N,cd,K-1] (undefined = zeros) are the hand-off states of the prefixes;
+// ssm_out [N,H,P,N] / conv_out [N,cd,K-1] receive the states after the segment (graph-connected).
+Tensor mamba_packed_seg(const Tensor& h, const Layer& L, const Ctx& c, const std::vector<int64_t>& lens, const Tensor& h0, const Tensor& conv_ctx, Tensor* ssm_out, Tensor* conv_out) {
+  const Config& cf = *c.cfg;
+  const int64_t Ts = h.size(1), H = cf.mamba_num_heads, P = cf.mamba_head_dim, N = cf.ssm_state_size, G = cf.n_groups, K = cf.conv_kernel;
+  const int64_t di = cf.d_inner(), cd = cf.conv_dim();
+  Tensor proj = lin(h, L.in_proj, c);
+  const int64_t d_mlp = (proj.size(-1) - 2 * di - 2 * G * N - H) / 2;
+  Tensor z = proj.narrow(-1, 2 * d_mlp, di);
+  Tensor xBC = proj.narrow(-1, 2 * d_mlp + di, cd).transpose(1, 2);   // [1,cd,Ts]
+  Tensor dt_raw = proj.narrow(-1, 2 * d_mlp + di + cd, H);
+  // causal depthwise conv, restarted at every sequence (left context = the prefix's last K-1 pre-conv columns, zeros without a prefix)
+  c10::optional<Tensor> bias;
+  if (cf.use_conv_bias && L.conv_b.defined()) bias = L.conv_b.to(c.adt);
+  Tensor cw = L.conv_w.to(c.adt);
+  std::vector<Tensor> convs, tails;
+  int64_t off = 0;
+  for (size_t n = 0; n < lens.size(); ++n) {
+    Tensor left = conv_ctx.defined() ? conv_ctx.narrow(0, static_cast<int64_t>(n), 1).to(c.adt) : at::zeros({1, cd, K - 1}, xBC.options());
+    Tensor ext = at::cat({left, xBC.narrow(-1, off, lens[n])}, -1);
+    convs.push_back(at::conv1d(ext, cw, bias, at::IntArrayRef{1}, at::IntArrayRef{0}, at::IntArrayRef{1}, cd));
+    tails.push_back(ext.narrow(-1, ext.size(-1) - (K - 1), K - 1));
+    off += lens[n];
+  }
+  if (conv_out) *conv_out = at::cat(tails, 0);
+  Tensor conv = convs.size() == 1 ? convs[0] : at::cat(convs, -1);   // [1,cd,Ts]
+  Tensor hbc = at::silu(conv).transpose(1, 2);
+  Tensor hs = hbc.narrow(-1, 0, di), Bm = hbc.narrow(-1, di, G * N), Cm = hbc.narrow(-1, di + G * N, G * N);
+  Tensor A = -at::exp(L.A_log.to(c.sdt));
+  Tensor dt = at::softplus(dt_raw.to(c.sdt) + L.dt_bias.to(c.sdt));
+  c10::optional<c10::Scalar> mn = c10::Scalar(cf.dt_clamp_min), mx;
+  if (std::isfinite(cf.dt_clamp_max)) mx = c10::Scalar(cf.dt_clamp_max);
+  dt = at::clamp(dt, mn, mx);
+  Tensor xs = hs.reshape({1, Ts, H, P}).to(c.sdt);
+  Tensor Bh = Bm.reshape({1, Ts, G, N}).to(c.sdt).repeat_interleave(H / G, 2);
+  Tensor Ch = Cm.reshape({1, Ts, G, N}).to(c.sdt).repeat_interleave(H / G, 2);
+  Tensor cu = cu_of(lens);
+  auto yst = c.o->ssd ? c.o->ssd(xs, dt, A, Bh, Ch, L.D.to(c.sdt), h0, cf.chunk_size, cu) : ssd_aten(xs, dt, A, Bh, Ch, L.D.to(c.sdt), h0, cf.chunk_size, cu);
+  if (ssm_out) *ssm_out = yst.second;
+  Tensor y = yst.first.reshape({1, Ts, di});
+  Tensor g = rms_gated_grouped(y, z, L.gnorm, G, cf.norm_eps).to(c.adt);
+  return lin(g, L.out_proj, c);
+}
+
+// Attention per sequence (causality restarts at every sequence). prefix[n] (optional, per sequence of this segment): the K/V the sequence continues; kv_out receives every sequence's full K/V.
+Tensor attn_packed_seg(const Tensor& h, const Layer& L, const Ctx& c, const std::vector<int64_t>& lens, const std::vector<LayerState>* prefix, std::vector<LayerState>* kv_out) {
+  std::vector<Tensor> outs;
+  int64_t off = 0;
+  if (kv_out) kv_out->assign(lens.size(), LayerState{});
+  for (size_t n = 0; n < lens.size(); ++n) {
+    const LayerState* sin = (prefix && n < prefix->size()) ? &(*prefix)[n] : nullptr;
+    outs.push_back(attn_fwd(h.narrow(1, off, lens[n]), L, c, sin, kv_out ? &(*kv_out)[n] : nullptr));
+    off += lens[n];
+  }
+  return outs.size() == 1 ? outs[0] : at::cat(outs, 1);
+}
+
+std::vector<int64_t> resp_index_vec(const SeqLayout& lay) { return lay.resp_group; }
+
+// mixer of one block on the packed [T,hidden] layout (the block's pre-norm already applied)
+Tensor mixer_packed(const Layer& L, const Tensor& h2, const SeqLayout& lay, const Ctx& c) {
+  if (L.type == BlockType::MoE) return moe_fwd(h2, L, c);
+  if (L.type == BlockType::MLP) return mlp_fwd(h2, L, c);
+  const int64_t T = h2.size(0);
+  TORCH_CHECK(lay.tokens() == T, "nemotron_h: SeqLayout covers ", lay.tokens(), " tokens, activations have ", T);
+  Tensor h = h2.unsqueeze(0);
+  if (!lay.grouped) {
+    if (L.type == BlockType::Mamba) return mamba_packed_seg(h, L, c, lay.lens, Tensor(), Tensor(), nullptr, nullptr).squeeze(0);
+    return attn_packed_seg(h, L, c, lay.lens, nullptr, nullptr).squeeze(0);
+  }
+  int64_t Tp = 0;
+  for (int64_t l : lay.prompt_lens) Tp += l;
+  Tensor hp = h.narrow(1, 0, Tp), hr = h.narrow(1, Tp, T - Tp);
+  Tensor gi = torch::tensor(resp_index_vec(lay), torch::kInt64).to(h2.device());
+  if (L.type == BlockType::Mamba) {
+    Tensor ssm, conv;
+    Tensor yp = mamba_packed_seg(hp, L, c, lay.prompt_lens, Tensor(), Tensor(), &ssm, &conv);
+    Tensor yr = mamba_packed_seg(hr, L, c, lay.resp_lens, ssm.index_select(0, gi), conv.index_select(0, gi), nullptr, nullptr);
+    return at::cat({yp, yr}, 1).squeeze(0);
+  }
+  std::vector<LayerState> kv;
+  Tensor yp = attn_packed_seg(hp, L, c, lay.prompt_lens, nullptr, &kv);
+  std::vector<LayerState> pre;
+  for (int64_t g : lay.resp_group) pre.push_back(kv[static_cast<size_t>(g)]);
+  Tensor yr = attn_packed_seg(hr, L, c, lay.resp_lens, &pre, nullptr);
+  return at::cat({yp, yr}, 1).squeeze(0);
+}
+
 Tensor layer_fwd(const Layer& L, const Tensor& x, const Ctx& c, const LayerState* sin, LayerState* sout) {
   Tensor h = rms(x, L.norm, c.cfg->norm_eps);
   switch (L.type) {
@@ -412,7 +542,7 @@ Config Config::FromFile(const std::string& path) {
   c.mamba_num_heads = i64("mamba_num_heads", 0); c.mamba_head_dim = i64("mamba_head_dim", 0); c.ssm_state_size = i64("ssm_state_size", 0);
   c.n_groups = i64("n_groups", 1); c.conv_kernel = i64("conv_kernel", 4); c.chunk_size = i64("chunk_size", 128);
   c.use_conv_bias = t.value("use_conv_bias", true);
-  c.dt_clamp_min = f64("time_step_min", 0.0);
+  c.time_step_min = f64("time_step_min", 0.0);   // dt_clamp_min stays 0 (no clamp, as the serving path); LoadOpts::hf_dt_clamp switches the HF fallback clamp on
   c.n_routed_experts = i64("n_routed_experts", 0); c.num_experts_per_tok = i64("num_experts_per_tok", 0);
   c.moe_intermediate_size = i64("moe_intermediate_size", 0); c.moe_latent_size = i64("moe_latent_size", 0);
   c.moe_shared_expert_intermediate_size = i64("moe_shared_expert_intermediate_size", 0);
@@ -479,23 +609,28 @@ QWeight load_experts(const utils::safetensors::SafetensorsCollection& coll, cons
 Model Model::Load(const std::string& dir, torch::Device device, const LoadOpts& opts) {
   Model m;
   m.cfg = Config::FromFile(dir + "/config.json");
+  if (opts.hf_dt_clamp) m.cfg.dt_clamp_min = m.cfg.time_step_min;
   m.device = device;
   auto coll = utils::safetensors::SafetensorsCollection::FromDirectory(dir);
   std::string pre = "backbone.", lmpre = "";
   if (coll.has("language_model.backbone.embeddings.weight")) { pre = "language_model.backbone."; lmpre = "language_model."; }
   else if (coll.has("model.embeddings.weight")) { pre = "model."; }
+  m.ckpt_prefix = pre;
   const auto dd = opts.dense_dtype;
   auto W = [&](const std::string& n) { return coll.get(n, dd, device); };
-  m.embed = W(pre + "embeddings.weight");
-  m.final_norm = W(pre + "norm_f.weight");
-  if (m.cfg.tie_word_embeddings) { m.lm_head.q.w = m.embed; }
-  else m.lm_head.q = load_qweight(coll, lmpre + "lm_head", device, dd);
+  if (opts.load_embed) m.embed = W(pre + "embeddings.weight");
+  if (opts.load_head) {
+    m.final_norm = W(pre + "norm_f.weight");
+    if (m.cfg.tie_word_embeddings) { m.lm_head.q.w = m.embed; }
+    else m.lm_head.q = load_qweight(coll, lmpre + "lm_head", device, dd);
+  }
   m.lm_head.name = "lm_head";
   const int64_t n = static_cast<int64_t>(m.cfg.blocks.size());
   m.layers.resize(n);
   for (int64_t i = 0; i < n; ++i) {
     Layer& L = m.layers[i];
     L.type = m.cfg.blocks[i];
+    if (!opts.only_layers.empty() && std::find(opts.only_layers.begin(), opts.only_layers.end(), i) == opts.only_layers.end()) continue;   // subset load: type only, no weights
     const std::string p = pre + "layers." + std::to_string(i) + ".";
     const std::string mx = p + "mixer.";
     L.norm = W(p + "norm.weight");
@@ -533,6 +668,7 @@ Model Model::Load(const std::string& dir, torch::Device device, const LoadOpts& 
 std::vector<Linear*> Model::lora_sites(const LoraTargets& t) {
   std::vector<Linear*> v;
   for (auto& L : layers) {
+    if (!L.norm.defined()) continue;   // layer not loaded (subset load)
     switch (L.type) {
       case BlockType::Mamba: if (t.mamba) v.insert(v.end(), {&L.in_proj, &L.out_proj}); break;
       case BlockType::Attention: if (t.attention) v.insert(v.end(), {&L.q_proj, &L.k_proj, &L.v_proj, &L.o_proj}); break;
@@ -566,7 +702,7 @@ void Model::attach_lora(int64_t rank, double alpha, uint64_t seed, const utils::
   for (Linear* l : lora_sites(t)) make(l->name, l->q.out_features(), l->q.in_features(), l->lora);
   if (t.router_gate)
     for (size_t i = 0; i < layers.size(); ++i)
-      if (layers[i].type == BlockType::MoE) make(idx_name(i, "gate"), layers[i].gate_w.size(0), layers[i].gate_w.size(1), layers[i].gate_lora);
+      if (layers[i].type == BlockType::MoE && layers[i].gate_w.defined()) make(idx_name(i, "gate"), layers[i].gate_w.size(0), layers[i].gate_w.size(1), layers[i].gate_lora);
 }
 
 std::vector<std::pair<std::string, Tensor>> Model::named_lora_params() {
@@ -669,6 +805,27 @@ Tensor Model::lm_logits(const Tensor& hn, const ForwardOptions& opt) {
 }
 
 Tensor Model::forward_embeds(const Tensor& embeds, const ForwardOptions& opt) { return lm_logits(forward_hidden(embeds, opt), opt); }
+
+// ---- block-level API (packed [T, hidden] layout)
+Tensor Model::norm_fwd(int64_t block, const Tensor& x, Compute) const { return rms(x, layers.at(block).norm, cfg.norm_eps); }
+
+Tensor Model::mixer_fwd(int64_t block, const Tensor& h, const SeqLayout& lay, const ForwardOptions& opt) const {
+  Ctx c{compute_dtype(opt.compute), stable_dt(compute_dtype(opt.compute)), &opt, &cfg};
+  TORCH_CHECK(layer_loaded(block), "nemotron_h: block ", block, " is not loaded");
+  return mixer_packed(layers[block], h, lay, c);
+}
+
+Tensor Model::block_fwd(int64_t block, const Tensor& x, const SeqLayout& lay, const ForwardOptions& opt) const {
+  return x + mixer_fwd(block, norm_fwd(block, x, opt.compute), lay, opt);
+}
+
+Tensor Model::final_norm_fwd(const Tensor& h, Compute) const { return rms(h, final_norm, cfg.norm_eps); }
+
+Tensor Model::head_logprob(const Tensor& hn, const Tensor& tgt, const ForwardOptions& opt) const {
+  Ctx c{compute_dtype(opt.compute), stable_dt(compute_dtype(opt.compute)), &opt, &cfg};
+  Tensor logits = lin(hn, lm_head, c).to(c.sdt);   // bf16 mode: bf16 GEMM, then fp32 (as HF); the [C, V] chunk is the only logits tensor that ever exists
+  return logits.gather(1, tgt.unsqueeze(1)).squeeze(1) - at::logsumexp(logits, 1);
+}
 
 Tensor Model::forward(const Tensor& ids, const ForwardOptions& opt) { return forward_embeds(embed_tokens(ids, opt.compute), opt); }
 

@@ -33,9 +33,11 @@ struct TORCH_API Config {
   // mamba2
   int64_t mamba_num_heads = 0, mamba_head_dim = 0, ssm_state_size = 0, n_groups = 1, conv_kernel = 4, chunk_size = 128;
   bool use_conv_bias = true;
-  // dt = clamp(softplus(dt_raw + dt_bias), dt_clamp_min, dt_clamp_max). HF's pure-torch fallback clamps at time_step_min only (the kernel path uses
-  // time_step_limit = (0, inf)); FromFile takes time_step_min. See docs in nemotron_h.cpp.
+  // dt = clamp(softplus(dt_raw + dt_bias), dt_clamp_min, dt_clamp_max). The serving path and the checkpoint's CUDA path (time_step_limit = (0, inf)) do NOT clamp: the
+  // trainer default is OFF (dt_clamp_min = 0). HF's pure-PyTorch fallback clamps at time_step_min (0.001 in the Super config); that is reproduced only on request
+  // (LoadOpts::hf_dt_clamp), which the HF-oracle gates use. FromFile stores the config value in time_step_min and leaves the clamp off.
   double dt_clamp_min = 0.0, dt_clamp_max = std::numeric_limits<double>::infinity();
+  double time_step_min = 0.0;   // config value (dt_bias init bound; HF fallback clamp floor)
   // moe
   int64_t n_routed_experts = 0, num_experts_per_tok = 0, moe_intermediate_size = 0, moe_latent_size = 0 /*0: no latent projections*/,
           moe_shared_expert_intermediate_size = 0, n_group = 1, topk_group = 1;
@@ -114,7 +116,7 @@ struct Probe {
 };
 
 /// SSD hook (the contract of mamba_chunk_scan_combined once the inputs are discretised): x [B,T,H,P] fp32, dt [B,T,H] (softplus+clamp applied), A [H] (<0), Bh/Ch [B,T,H,N]
-/// (already expanded per head), D [H], h0 [B,H,P,N] or undefined, chunk, cu_seqlens (undefined = batched [B,T]; defined = packed varlen: B == 1, T = total tokens, int32 [N+1], h0/final state [N,H,P,N]; the ATen versions reject it, the AOT kernel implements it) -> {y [B,T,H,P] incl. the D x skip, final state}. The pure-ATen version is ssd_aten();
+/// (already expanded per head), D [H], h0 [B,H,P,N] or undefined, chunk, cu_seqlens (undefined = batched [B,T]; defined = packed varlen: B == 1, T = total tokens, int32 [N+1], h0/final state [N,H,P,N]; ssd_aten / ssd_serial loop the sequences and carry h0[n] per sequence (ssd_varlen_loop), the AOT kernel implements it natively) -> {y [B,T,H,P] incl. the D x skip, final state}. The pure-ATen version is ssd_aten();
 /// the AOT Triton autograd::Function plugs in here.
 using SsdFn = std::function<std::pair<Tensor, Tensor>(const Tensor& x, const Tensor& dt, const Tensor& A, const Tensor& Bh, const Tensor& Ch, const Tensor& D,
                                                       const Tensor& h0, int64_t chunk, const Tensor& cu_seqlens)>;
@@ -154,6 +156,24 @@ struct TORCH_API WeightSlot {
 
 struct TORCH_API LoadOpts {
   torch::ScalarType dense_dtype = torch::kBFloat16;  // storage dtype of dense frozen weights
+  bool hf_dt_clamp = false;                          // true: dt_clamp_min = config time_step_min (HF fallback behaviour); false: no clamp (serving path)
+  std::vector<int64_t> only_layers;                  // non-empty: load only these block indices (layer-subset tests on the 120B checkpoint); other layers keep their type, no weights
+  bool load_embed = true, load_head = true;          // false: skip the embedding / the final norm + lm_head (subset tests feed hidden states)
+};
+
+/// Packed-token layout of a micro-batch. Plain: `lens` sequences concatenated in row order. Grouped (prefix sharing): rows are [all prompts | all responses]
+/// (group order, response order inside a group); response n continues prompt resp_group[n] (SSM state, conv left context, attention K/V are handed over, graph-connected).
+struct TORCH_API SeqLayout {
+  std::vector<int64_t> lens;
+  bool grouped = false;
+  std::vector<int64_t> prompt_lens, resp_lens, resp_group;
+  int64_t tokens() const {
+    int64_t t = 0;
+    if (!grouped) { for (int64_t l : lens) t += l; return t; }
+    for (int64_t l : prompt_lens) t += l;
+    for (int64_t l : resp_lens) t += l;
+    return t;
+  }
 };
 
 class TORCH_API Model {
@@ -163,6 +183,7 @@ class TORCH_API Model {
   Linear lm_head;            // dense or FP8
   std::vector<Layer> layers;
   torch::Device device = torch::kCPU;
+  std::string ckpt_prefix;   // tensor-name prefix of the loaded checkpoint ("language_model.backbone." omni wrapper, "backbone." / "model." bare text model)
 
   static Model Load(const std::string& dir, torch::Device device, const LoadOpts& opts = {});
 
@@ -178,6 +199,17 @@ class TORCH_API Model {
   Tensor lm_logits(const Tensor& hn, const ForwardOptions& opt = {});               // frozen head
   Tensor forward(const Tensor& ids, const ForwardOptions& opt = {});                // [B,T,V]
   Tensor forward_embeds(const Tensor& embeds, const ForwardOptions& opt = {});
+
+  // ---- block-level API for the memory-planned trainer step (TrainableModel). Packed-token layout: activations are [T, hidden] with the sequences concatenated (SeqLayout).
+  // One block = x + mixer(norm(x)) ("one half"). Mamba / attention mixers run per sequence (conv left context and attention causality restart at every sequence; the SSD is called
+  // ONCE per segment with cu_seqlens through ForwardOptions::ssd -- ssd_aten loops the sequences, the AOT kernel does it natively); MoE / MLP are token-local.
+  Tensor norm_fwd(int64_t block, const Tensor& x, Compute c) const;                                          // the block's pre-norm
+  Tensor mixer_fwd(int64_t block, const Tensor& h, const SeqLayout& lay, const ForwardOptions& opt) const;   // [T,hidden] -> [T,hidden]
+  Tensor block_fwd(int64_t block, const Tensor& x, const SeqLayout& lay, const ForwardOptions& opt) const;   // x + mixer(norm(x))
+  Tensor final_norm_fwd(const Tensor& h, Compute c) const;
+  /// logprob of tgt under softmax(lm_head(hn)): [C] in the stable dtype (fp32; fp64 in FP64 mode). hn [C, hidden].
+  Tensor head_logprob(const Tensor& hn, const Tensor& tgt, const ForwardOptions& opt) const;
+  bool layer_loaded(int64_t block) const { return block >= 0 && block < static_cast<int64_t>(layers.size()) && layers[block].norm.defined(); }
 };
 
 /// Loads one frozen weight "<base>.weight" in whichever format the checkpoint stores it (dense / FP8 / NVFP4). Exposed for tests.

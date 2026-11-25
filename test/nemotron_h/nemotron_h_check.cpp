@@ -127,7 +127,7 @@ static void compare_runs(const std::string& tag, const std::string& what, const 
 }
 
 static std::unique_ptr<Model> load_with_lora(const std::string& dir, Compute c, torch::ScalarType dense = kF) {
-  auto m = std::make_unique<Model>(Model::Load(dir, torch::kCPU, LoadOpts{dense}));
+  auto m = std::make_unique<Model>(Model::Load(dir, torch::kCPU, LoadOpts{dense, true}));
   auto init = SafetensorsCollection::FromFile(dir + "/lora_init.safetensors");
   LoraTargets t; t.router_gate = true;
   m->attach_lora(4, 8.0, 0, &init, t, c == Compute::FP64 ? kD : kF);
