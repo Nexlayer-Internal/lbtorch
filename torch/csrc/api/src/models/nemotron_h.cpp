@@ -526,7 +526,6 @@ Tensor mamba_packed_seg(const Tensor& h, const Layer& L, const Ctx& c, const std
     NVPOP();
     NVPUSH("mamba ssd");
     yst = c.o->ssd_packed(hs.reshape({Ts, H, P}), dt.reshape({Ts, H}), A, Bm.reshape({Ts, G, N}), Cm.reshape({Ts, G, N}), L.D.to(c.sdt), h0, cf.chunk_size, cu);
-    yst.first = yst.first.to(c.sdt);
   } else {
     Tensor xs = hs.reshape({1, Ts, H, P}).to(c.sdt);
     Tensor Bh = Bm.reshape({1, Ts, G, N}).to(c.sdt).repeat_interleave(H / G, 2);
@@ -539,7 +538,8 @@ Tensor mamba_packed_seg(const Tensor& h, const Layer& L, const Ctx& c, const std
   NVPUSH("mamba gnorm");
   if (ssm_out) *ssm_out = yst.second;
   Tensor y = yst.first.reshape({1, Ts, di});
-  Tensor g = rms_gated_grouped(y, z, L.gnorm, G, cf.norm_eps).to(c.adt);
+  Tensor g = (c.o->gnorm && c.o->ssd_packed && y.scalar_type() == c.adt) ? c.o->gnorm(y, z, L.gnorm, G, cf.norm_eps)
+                                                                         : rms_gated_grouped(y.to(c.sdt), z, L.gnorm, G, cf.norm_eps).to(c.adt);
   NVPOP();
   return lin(g, L.out_proj, c);
 }

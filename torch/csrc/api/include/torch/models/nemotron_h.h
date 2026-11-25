@@ -134,6 +134,10 @@ TORCH_API std::pair<Tensor, Tensor> ssd_serial(const Tensor& x, const Tensor& dt
 /// 1 where unsaturated, 0 where saturated.
 TORCH_API Tensor act_quant_ste(const Tensor& x, const QWeight& w);
 
+/// Mamba gated grouped RMSNorm hook (fused kernel supplied by the trainer; used by the packed mixers together with SsdPackedFn, whose y is already in the activation dtype):
+/// y, z [..., d_inner] activation dtype, w [d_inner], groups, eps -> activation-dtype value of  w * (h * rsqrt(mean_group(h^2) + eps)),  h = y * silu(z) computed in fp32.
+using GnormFn = std::function<Tensor(const Tensor& y, const Tensor& z, const Tensor& w, int64_t groups, double eps)>;
+
 enum class MoeImpl { Loop, GroupedMM };
 
 /// Dequantisation hook (device kernel supplied by the trainer): a quantised QWeight (single weight or a stack of experts) -> dense [..., out, in] in `dt`, bit-identical to
@@ -159,6 +163,7 @@ struct TORCH_API ForwardOptions {
   DequantFn dequant;        // default QWeight::dequant; see DequantFn
   LoraFn lora;              // default: ATen fp32 adapter; see LoraFn
   SsdPackedFn ssd_packed;   // packed mixers only; wins over `ssd` when set; see SsdPackedFn
+  GnormFn gnorm;            // packed mixers, only with ssd_packed; default rms_gated_grouped (ATen, fp32 temporaries)
   Probe* probe = nullptr;
   const std::vector<LayerState>* state_in = nullptr;  // per layer; undefined tensors = no prefix
   std::vector<LayerState>* state_out = nullptr;       // filled (graph-connected) when non-null
